@@ -14,6 +14,14 @@ concurrency:
   group: deploy-prod
   cancel-in-progress: false
 
+# GITHUB_TOKEN needs explicit grants for the post-deploy steps:
+#   contents: write — push to the wiki repo (it's a peer git repo)
+#   issues:   write — open / update / comment the build status issue
+# Everything else stays at the default `read`.
+permissions:
+  contents: write
+  issues: write
+
 jobs:
   deploy:
     name: rsync + docker compose up
@@ -115,16 +123,198 @@ jobs:
             --data '{"purge_everything":true}'
 
       - name: Smoke test
-        # Hit the API healthz through the public URL — fails the job if
-        # the new deploy is unreachable so we get a clear red signal in
-        # the GitHub Actions UI.
+        id: smoke
+        # Hit the API healthz through the public URL. We DON'T fail the
+        # job here anymore — the wiki + issue update steps need to run
+        # regardless of result, and they record the outcome themselves.
+        # The job's final status is determined by the explicit `Mark
+        # job failed if smoke failed` step at the bottom.
         run: |
           for i in 1 2 3 4 5; do
             if curl -fsS "https://${{ secrets.PUBLIC_HOST || 'tcgstudio.online' }}/healthz" >/dev/null; then
               echo "deploy healthy"
+              echo "result=healthy" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             sleep 5
           done
           echo "smoke test failed"
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------
+      # Post-deploy bookkeeping: wiki + GitHub issues. These run even
+      # if the smoke test failed so the wiki + the build-status issue
+      # accurately reflect a bad deploy (status: failed).
+      # ----------------------------------------------------------------
+
+      - name: Update wiki
+        # The wiki is its own git repo at <repo>.wiki.git. GITHUB_TOKEN
+        # has access because `contents: write` is granted at the
+        # workflow level. We write two pages:
+        #
+        #   Home.md         — landing page, lists last 10 deploys
+        #   Build-Status.md — one-page summary of the latest run
+        #
+        # The deploy-log table is regenerated each run from the
+        # existing rows + the new row, so the wiki accumulates a
+        # rolling deploy history without us needing to keep state
+        # elsewhere.
+        if: always()
+        env:
+          DEPLOY_RESULT: ${{ steps.smoke.outputs.result || 'unknown' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PUBLIC_HOST: ${{ secrets.PUBLIC_HOST || 'tcgstudio.online' }}
+        run: |
+          set -e
+          WIKI_REPO="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git"
+          # First-time bootstrap: if the wiki has never been cloned the
+          # remote repo doesn't exist yet (404). Initialise locally and
+          # push to create it.
+          WIKI_DIR="$RUNNER_TEMP/wiki"
+          rm -rf "$WIKI_DIR"
+          if git clone --depth=1 "$WIKI_REPO" "$WIKI_DIR" 2>/dev/null; then
+            echo "cloned existing wiki"
+          else
+            echo "no wiki yet — bootstrapping"
+            mkdir -p "$WIKI_DIR"
+            cd "$WIKI_DIR"
+            git init -b master
+            git remote add origin "$WIKI_REPO"
+            git config user.email "actions@github.com"
+            git config user.name "GitHub Actions"
+          fi
+          cd "$WIKI_DIR"
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+
+          NOW="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          SHA_SHORT="$(echo '${{ github.sha }}' | cut -c1-7)"
+          ROW="| $NOW | [\`$SHA_SHORT\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) | $DEPLOY_RESULT | [run]($RUN_URL) |"
+
+          # Build-Status.md — single-snapshot of the latest deploy.
+          cat > Build-Status.md <<EOF
+          # Build status
+
+          Latest deploy of [\`${{ github.repository }}\`](${{ github.server_url }}/${{ github.repository }}).
+
+          | Field        | Value |
+          | ------------ | ----- |
+          | Status       | **$DEPLOY_RESULT** |
+          | Commit       | [\`$SHA_SHORT\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) |
+          | Workflow run | [#${{ github.run_number }}]($RUN_URL) |
+          | Triggered by | @${{ github.actor }} |
+          | Public host  | https://$PUBLIC_HOST |
+          | Deployed at  | $NOW |
+
+          [Live site]( https://$PUBLIC_HOST ) ·
+          [Healthz]( https://$PUBLIC_HOST/healthz ) ·
+          [Run logs]( $RUN_URL )
+
+          ## Recent deploys
+
+          See **[Home](Home)** for the rolling deploy history.
+          EOF
+
+          # Home.md — keep the deploy log, prepend the new row.
+          OLD_LOG=""
+          if [ -f Home.md ] && grep -q '^<!--BEGIN_DEPLOY_LOG-->' Home.md; then
+            OLD_LOG=$(awk '/^<!--BEGIN_DEPLOY_LOG-->/,/^<!--END_DEPLOY_LOG-->/' Home.md | sed '/^<!--BEGIN_DEPLOY_LOG-->/d;/^<!--END_DEPLOY_LOG-->/d')
+          fi
+          # Drop the header rows so we can re-emit them once; trim to
+          # 30 deploys so the page stays readable.
+          OLD_ROWS=$(echo "$OLD_LOG" | grep -E '^\| [0-9]{4}-' | head -29 || true)
+
+          cat > Home.md <<EOF
+          # TCGStudio
+
+          Build the game. Publish the world. Own the brand.
+
+          * [Live site](https://$PUBLIC_HOST)
+          * [Repository](${{ github.server_url }}/${{ github.repository }})
+          * [Build status](Build-Status) (last: **$DEPLOY_RESULT** @ $NOW)
+          * [Open issues](${{ github.server_url }}/${{ github.repository }}/issues)
+
+          ## Deploy log
+
+          <!--BEGIN_DEPLOY_LOG-->
+          | When | Commit | Result | Run |
+          | ---- | ------ | ------ | --- |
+          $ROW
+          $OLD_ROWS
+          <!--END_DEPLOY_LOG-->
+          EOF
+
+          git add Home.md Build-Status.md
+          # `commit -m … || true` so a no-op (nothing changed) doesn't
+          # fail the workflow step. Possible on a re-run with the same
+          # SHA + same minute.
+          git commit -m "deploy: ${{ github.sha }} ($DEPLOY_RESULT)" || echo "wiki unchanged"
+          git push origin HEAD:master
+
+      - name: Update build-status issue
+        # Maintain a single "Build status" GitHub issue: title is fixed,
+        # body is rewritten on each deploy, status comments are appended.
+        # If the issue doesn't exist yet we open one.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_RESULT: ${{ steps.smoke.outputs.result || 'unknown' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PUBLIC_HOST: ${{ secrets.PUBLIC_HOST || 'tcgstudio.online' }}
+        run: |
+          set -e
+          SHA_SHORT="$(echo '${{ github.sha }}' | cut -c1-7)"
+          NOW="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          TITLE="Build status"
+          # The body is a Markdown snapshot of the latest deploy. The
+          # comments are a per-deploy log entry.
+          BODY=$(printf '%s\n' \
+            "Single source of truth for the latest deploy. Auto-updated by the **Deploy to GCE VM** workflow." \
+            "" \
+            "| Field        | Value |" \
+            "| ------------ | ----- |" \
+            "| Status       | **$DEPLOY_RESULT** |" \
+            "| Commit       | [\`$SHA_SHORT\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) |" \
+            "| Workflow run | [#${{ github.run_number }}]($RUN_URL) |" \
+            "| Triggered by | @${{ github.actor }} |" \
+            "| Public host  | https://$PUBLIC_HOST |" \
+            "| Updated      | $NOW |" \
+            "" \
+            "See the [wiki](${{ github.server_url }}/${{ github.repository }}/wiki/Build-Status) for the full deploy log." \
+          )
+
+          # gh issue list returns json; find by exact title. We tag the
+          # issue with `build-status` so it's also discoverable by
+          # label.
+          ISSUE_NUMBER=$(gh issue list --repo "${{ github.repository }}" \
+            --state all --search "in:title \"$TITLE\"" \
+            --json number,title --jq ".[] | select(.title==\"$TITLE\") | .number" | head -n1)
+          # Ensure the label exists. `|| true` because it 422s when the
+          # label is already there.
+          gh label create build-status --color BFD4F2 --description "Auto-managed by the deploy workflow." 2>/dev/null || true
+
+          if [ -z "$ISSUE_NUMBER" ]; then
+            gh issue create --repo "${{ github.repository }}" \
+              --title "$TITLE" --body "$BODY" \
+              --label build-status
+          else
+            gh issue edit "$ISSUE_NUMBER" --repo "${{ github.repository }}" \
+              --body "$BODY" --add-label build-status
+            gh issue comment "$ISSUE_NUMBER" --repo "${{ github.repository }}" \
+              --body "Deploy **$DEPLOY_RESULT** — \`$SHA_SHORT\` · [run #${{ github.run_number }}]($RUN_URL) · $NOW"
+            # Keep the issue open while results are unhealthy; close it
+            # automatically when the latest deploy is healthy.
+            if [ "$DEPLOY_RESULT" = "healthy" ]; then
+              gh issue close "$ISSUE_NUMBER" --repo "${{ github.repository }}" --reason completed || true
+            else
+              gh issue reopen "$ISSUE_NUMBER" --repo "${{ github.repository }}" || true
+            fi
+          fi
+
+      - name: Mark job failed if smoke failed
+        # Final gate — keeps the GitHub Actions badge red on smoke
+        # failure, even though we ran the wiki + issue updates first.
+        if: steps.smoke.outputs.result != 'healthy'
+        run: |
+          echo "smoke test failed — see Build-Status wiki page and issue for details"
           exit 1
