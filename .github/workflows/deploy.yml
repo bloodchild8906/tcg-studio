@@ -159,7 +159,13 @@ jobs:
         # existing rows + the new row, so the wiki accumulates a
         # rolling deploy history without us needing to keep state
         # elsewhere.
+        #
+        # `continue-on-error` because the wiki has to be initialised
+        # manually once (visit the repo's Wiki tab → "Create the
+        # first page") before clone/push will work. We don't want a
+        # missing wiki to fail the whole deploy.
         if: always()
+        continue-on-error: true
         env:
           DEPLOY_RESULT: ${{ steps.smoke.outputs.result || 'unknown' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -254,8 +260,10 @@ jobs:
       - name: Update build-status issue
         # Maintain a single "Build status" GitHub issue: title is fixed,
         # body is rewritten on each deploy, status comments are appended.
-        # If the issue doesn't exist yet we open one.
+        # If the issue doesn't exist yet we open one. Tolerant of failure
+        # so a flaky issue API doesn't fail a healthy deploy.
         if: always()
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEPLOY_RESULT: ${{ steps.smoke.outputs.result || 'unknown' }}

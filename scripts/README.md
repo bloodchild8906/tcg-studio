@@ -67,3 +67,17 @@ the workflow needs a PAT with `project` scope stored as a repository secret:
 | `PROJECT_NUMBER` | The project number from `gh project list`      |
 
 When any of these are missing the project-attach step silently skips.
+
+### Initialize the wiki (one-time)
+
+The deploy workflow writes to the repository wiki, but GitHub requires the
+wiki to be initialized manually once before clone/push will work. To do
+this:
+
+1. In a browser, open
+   <https://github.com/bloodchild8906/tcg-studio/wiki>
+2. Click **Create the first page** and save anything (the deploy workflow
+   will overwrite it on the next push).
+
+Until that's done the **Update wiki** step in the workflow logs a failure
+and continues (it's wrapped in `continue-on-error: true`).
