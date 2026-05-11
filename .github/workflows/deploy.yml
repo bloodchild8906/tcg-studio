@@ -311,6 +311,32 @@ jobs:
             fi
           fi
 
+      - name: Attach build-status issue to project
+        # Push the build-status issue onto the TCG Studio project board so
+        # it's visible alongside the per-task issues. Requires a PAT with
+        # `project` scope in PROJECT_TOKEN (the default GITHUB_TOKEN can't
+        # touch Projects v2). When the secret isn't set we silently skip.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          PROJECT_OWNER: ${{ secrets.PROJECT_OWNER || 'bloodchild8906' }}
+          PROJECT_NUMBER: ${{ secrets.PROJECT_NUMBER }}
+        run: |
+          if [ -z "$GH_TOKEN" ] || [ -z "$PROJECT_NUMBER" ]; then
+            echo "PROJECT_TOKEN / PROJECT_NUMBER not configured — skipping project attach"
+            exit 0
+          fi
+          # Find the build-status issue we just touched.
+          ISSUE_URL=$(gh issue list --repo "${{ github.repository }}" \
+            --state all --search 'in:title "Build status"' \
+            --json url,title --jq ".[] | select(.title==\"Build status\") | .url" | head -n1)
+          if [ -z "$ISSUE_URL" ]; then
+            echo "build-status issue not found — skipping"
+            exit 0
+          fi
+          gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --url "$ISSUE_URL" 2>/dev/null || true
+          echo "attached $ISSUE_URL to project #$PROJECT_NUMBER"
+
       - name: Mark job failed if smoke failed
         # Final gate — keeps the GitHub Actions badge red on smoke
         # failure, even though we ran the wiki + issue updates first.

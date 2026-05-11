@@ -25,7 +25,15 @@
 param(
     [switch]$Apply = $false,
     [string]$Repo = "bloodchild8906/tcg-studio",
-    [string]$TasksJson = "scripts\tasks.json"
+    [string]$TasksJson = "scripts\tasks.json",
+    # Project (v2) settings. If -ProjectNumber is set the script also
+    # adds every seeded issue to that project. If -CreateProject is set
+    # without -ProjectNumber the script will create a "TCG Studio"
+    # project on the repo's owner and use it.
+    [string]$ProjectOwner = "bloodchild8906",
+    [string]$ProjectTitle = "TCG Studio",
+    [int]$ProjectNumber = 0,
+    [switch]$CreateProject = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -140,4 +148,89 @@ This issue is auto-managed by `scripts/seed-issues.ps1`. Do not change the title
 if (-not $Apply) {
     Write-Host ""
     Write-Host "Dry run complete. Re-run with -Apply to push to GitHub."
+    return
 }
+
+# ---------------------------------------------------------------------------
+# Project board sync (Projects v2).
+#
+# Optional second phase that attaches every task issue to a GitHub
+# Project v2 board so the project view reflects the same task list.
+# Requires the `gh` token to carry the `project` scope:
+#
+#     gh auth refresh -s project,read:project
+#
+# Without that scope the project sub-commands return "missing required
+# scopes [read:project]"; we surface that as a friendly message and
+# skip the phase rather than failing the whole seed.
+# ---------------------------------------------------------------------------
+
+if ($ProjectNumber -eq 0 -and -not $CreateProject) {
+    Write-Host ""
+    Write-Host "Skipping project attach (no -ProjectNumber, no -CreateProject)."
+    Write-Host "  To attach: pass -ProjectNumber N (existing project), or -CreateProject (mint a new one)."
+    return
+}
+
+# Probe for project scope before doing anything destructive.
+$probe = gh project list --owner $ProjectOwner --format json 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning ""
+    Write-Warning "gh CLI is missing the 'project' scope on its token."
+    Write-Warning "Run:    gh auth refresh -s read:project,project"
+    Write-Warning "Then re-run this script."
+    Write-Warning "Skipping project phase."
+    return
+}
+
+# Resolve or create the project.
+if ($ProjectNumber -eq 0) {
+    $projects = $probe | ConvertFrom-Json
+    $match = $projects.projects | Where-Object { $_.title -eq $ProjectTitle } | Select-Object -First 1
+    if ($match) {
+        $ProjectNumber = [int]$match.number
+        Write-Host "Found existing project '$ProjectTitle' (#$ProjectNumber)."
+    } else {
+        Write-Host "Creating project '$ProjectTitle' on $ProjectOwner ..."
+        $createOutput = gh project create --owner $ProjectOwner --title $ProjectTitle --format json 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "gh project create failed: $createOutput"
+            return
+        }
+        $proj = $createOutput | ConvertFrom-Json
+        $ProjectNumber = [int]$proj.number
+        Write-Host "Created project #$ProjectNumber."
+    }
+}
+
+Write-Host ""
+Write-Host "Attaching issues to project #$ProjectNumber ..."
+
+# Reload the issue index — the create phase above may have added new
+# issues that aren't in our initial $existing snapshot.
+$existingJson = gh issue list --repo $Repo --state all --limit 500 --json number,title,url 2>$null
+$existing = $existingJson | ConvertFrom-Json
+$issueByTaskId = @{}
+foreach ($iss in $existing) {
+    if ($iss.title -match '^#(\d+)\s') {
+        $tid = [int]$matches[1]
+        $issueByTaskId[$tid] = $iss
+    }
+}
+
+$idx = 0
+foreach ($t in $tasks) {
+    $idx++
+    $tid = [int]$t.id
+    if (-not $issueByTaskId.ContainsKey($tid)) { continue }
+    $iss = $issueByTaskId[$tid]
+    Write-Host "[$idx/$total] attach #$($iss.number) → project #$ProjectNumber"
+    # `gh project item-add` is idempotent on the URL — re-attaching an
+    # already-attached issue 2>&1 returns a "already exists" message
+    # which we silently swallow.
+    gh project item-add $ProjectNumber --owner $ProjectOwner --url $iss.url 2>$null | Out-Null
+    Start-Sleep -Milliseconds 150
+}
+
+Write-Host ""
+Write-Host "Done. Project #$ProjectNumber now mirrors the task list."

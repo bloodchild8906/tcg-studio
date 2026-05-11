@@ -36,3 +36,34 @@ Requires the `gh` CLI authenticated with push access to the repo.
 
 When you add or change a task locally, edit `scripts/tasks.json`, then re-run
 `seed-issues.ps1 -Apply`. The script is idempotent.
+
+### Attaching to a Projects v2 board
+
+After the issues are seeded, you can mirror them onto a GitHub Project board.
+This requires the `gh` CLI token to carry the `project` scope, which it
+doesn't grab by default:
+
+```powershell
+# One-time scope refresh — opens a browser to consent
+gh auth refresh -s read:project,project
+
+# Create the "TCG Studio" project (if missing) and attach every issue
+.\scripts\seed-issues.ps1 -Apply -CreateProject
+
+# Or attach to an existing project by number
+.\scripts\seed-issues.ps1 -Apply -ProjectNumber 1
+```
+
+### Wiring the deploy workflow to the project
+
+The deploy workflow can attach the auto-managed **Build status** issue to the
+project on every push. The default `GITHUB_TOKEN` can't touch Projects v2, so
+the workflow needs a PAT with `project` scope stored as a repository secret:
+
+| Secret           | Value                                          |
+| ---------------- | ---------------------------------------------- |
+| `PROJECT_TOKEN`  | PAT with `project` scope (classic) or `Projects: read-write` (fine-grained) |
+| `PROJECT_OWNER`  | `bloodchild8906` (optional; defaults to this)  |
+| `PROJECT_NUMBER` | The project number from `gh project list`      |
+
+When any of these are missing the project-attach step silently skips.
