@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+build/
+out/
+.next/
+.turbo/
+.cache/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Docker volumes (persisted locally)
+.data/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# TypeScript
+*.tsbuildinfo
+
+# Vite
+.vite/
+
+# Secrets — NEVER commit. Keep this list explicit so a stray match
+# doesn't sneak through (e.g. someone names a config `.env.prod` thinking
+# the `.env.*.local` rule covers it — it doesn't).
+deploy/.env
+deploy/.env.prod
+deploy/.env.production
+deploy/.secrets.local
+*.secrets.local
+*.private.key
+*.pem
+.gcloud/
+gha-deploy.key
+gha-deploy.key.pub
+
+# Runtime detritus
+api-logs.txt
+*-logs.txt
+.data/
+deploy.log
+deploy*.log

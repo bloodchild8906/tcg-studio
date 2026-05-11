@@ -1,0 +1,61 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: tcg-api
+  annotations:
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/cloudsql-instances: "${PROJECT_ID}:${REGION}:${DB_INSTANCE}"
+    spec:
+      containerConcurrency: 80
+      containers:
+      - image: "${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPOSITORY}/api:${TAG}"
+        ports:
+        - name: http1
+          containerPort: 4000
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: DATABASE_URL
+          value: "postgresql://${DB_USER}:${DB_PASSWORD}@/tcgstudio?host=/cloudsql/${PROJECT_ID}:${REGION}:${DB_INSTANCE}"
+        - name: CORS_ORIGINS
+          value: "${DESIGNER_URL}"
+        - name: ROOT_DOMAIN
+          value: "${ROOT_DOMAIN}"
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: tcg-api-secrets
+              key: jwt-secret
+        - name: PRETTY_LOGS
+          value: "false"
+        - name: STORAGE_PROVIDER
+          value: "gcs"
+        - name: GCS_BUCKET
+          value: "${GCS_BUCKET}"
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 4000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 4000
+          periodSeconds: 30
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 4000
+          periodSeconds: 15
+          timeoutSeconds: 3

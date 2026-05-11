@@ -1,0 +1,593 @@
+/**
+ * Typed API client.
+ *
+ * Single small fetch wrapper, no extra dependencies. Every request carries
+ * `X-Tenant-Slug` so the API's tenant context plugin resolves the same demo
+ * tenant the seed created.
+ *
+ * Why not pull in TanStack Query or trpc yet:
+ *   - The designer's network surface is tiny (4 endpoints).
+ *   - Loading state is simple enough to hold in the Zustand store.
+ *   - We can add a query layer when caching / background refetch matters.
+ */
+/// Read at module load. Vite injects the env var at build time.
+const API_BASE = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
+/**
+ * Active tenant slug. Mutable — `setActiveTenantSlug` is called from the
+ * store whenever the user picks a different tenant. A module-level variable
+ * keeps the network layer simple (no need to plumb the slug through every
+ * call site) without coupling the API client to the React store.
+ *
+ * Default value matches the seed so first-load works against a fresh DB.
+ */
+let _tenantSlug = "demo";
+export function setActiveTenantSlug(slug) {
+    _tenantSlug = slug;
+}
+export function getActiveTenantSlug() {
+    return _tenantSlug;
+}
+/**
+ * Bearer token used for authenticated requests. Restored from localStorage
+ * at module load so a refresh keeps the user signed in.
+ */
+const AUTH_TOKEN_KEY = "tcgstudio.auth.token";
+let _authToken = (() => {
+    try {
+        return typeof window !== "undefined"
+            ? window.localStorage.getItem(AUTH_TOKEN_KEY)
+            : null;
+    }
+    catch {
+        return null;
+    }
+})();
+export function setAuthToken(token) {
+    _authToken = token;
+    try {
+        if (typeof window === "undefined")
+            return;
+        if (token)
+            window.localStorage.setItem(AUTH_TOKEN_KEY, token);
+        else
+            window.localStorage.removeItem(AUTH_TOKEN_KEY);
+    }
+    catch {
+        // Storage write failed (private mode / quota) — token still works in-memory.
+    }
+}
+export function getAuthToken() {
+    return _authToken;
+}
+export class ApiError extends Error {
+    status;
+    payload;
+    constructor(status, message, payload) {
+        super(message);
+        this.status = status;
+        this.payload = payload;
+        this.name = "ApiError";
+    }
+}
+async function request(path, options = {}) {
+    const url = new URL(path, API_BASE);
+    if (options.query) {
+        for (const [k, v] of Object.entries(options.query)) {
+            if (v !== undefined && v !== "")
+                url.searchParams.set(k, v);
+        }
+    }
+    const headers = {
+        "X-Tenant-Slug": _tenantSlug,
+    };
+    if (options.body !== undefined) {
+        headers["Content-Type"] = "application/json";
+    }
+    if (_authToken)
+        headers["Authorization"] = `Bearer ${_authToken}`;
+    const response = await fetch(url.toString(), {
+        method: options.method ?? "GET",
+        headers,
+        body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+        signal: options.signal,
+    });
+    // 204 No Content — nothing to parse.
+    if (response.status === 204)
+        return undefined;
+    const text = await response.text();
+    const parsed = text ? safeParseJson(text) : undefined;
+    if (!response.ok) {
+        throw new ApiError(response.status, `${response.status} ${response.statusText} — ${parsed?.message ??
+            parsed?.error ??
+            "request failed"}`, parsed);
+    }
+    return parsed;
+}
+function safeParseJson(text) {
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return text;
+    }
+}
+// ---------------------------------------------------------------------------
+// Auth (top-level — no tenant scope)
+// ---------------------------------------------------------------------------
+export async function signUp(input) {
+    const r = await request("/api/v1/auth/signup", {
+        method: "POST",
+        body: input,
+    });
+    setAuthToken(r.token);
+    return r;
+}
+export async function signIn(input) {
+    const r = await request("/api/v1/auth/login", {
+        method: "POST",
+        body: input,
+    });
+    setAuthToken(r.token);
+    return r;
+}
+export async function fetchMe() {
+    return await request("/api/v1/auth/me");
+}
+export function signOut() {
+    setAuthToken(null);
+}
+// ---------------------------------------------------------------------------
+// Memberships (tenant-scoped)
+// ---------------------------------------------------------------------------
+export async function listMemberships() {
+    const r = await request("/api/v1/memberships");
+    return r.memberships;
+}
+export async function inviteMember(input) {
+    const r = await request("/api/v1/memberships", {
+        method: "POST",
+        body: input,
+    });
+    return r.membership;
+}
+export async function updateMembershipRole(id, role) {
+    const r = await request(`/api/v1/memberships/${id}`, {
+        method: "PATCH",
+        body: { role },
+    });
+    return r.membership;
+}
+export async function removeMembership(id) {
+    await request(`/api/v1/memberships/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Tenants (top-level — registered outside the tenant scope on the server)
+// ---------------------------------------------------------------------------
+export async function listTenants() {
+    const r = await request("/api/v1/tenants");
+    return r.tenants;
+}
+export async function createTenant(input) {
+    const r = await request("/api/v1/tenants", {
+        method: "POST",
+        body: input,
+    });
+    return r.tenant;
+}
+export async function updateTenant(id, patch) {
+    const r = await request(`/api/v1/tenants/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.tenant;
+}
+export async function deleteTenant(id) {
+    await request(`/api/v1/tenants/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Endpoints
+// ---------------------------------------------------------------------------
+export async function listProjects() {
+    const r = await request("/api/v1/projects");
+    return r.projects;
+}
+export async function createProject(input) {
+    const r = await request("/api/v1/projects", {
+        method: "POST",
+        body: input,
+    });
+    return r.project;
+}
+export async function updateProject(id, patch) {
+    const r = await request(`/api/v1/projects/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.project;
+}
+export async function deleteProject(id) {
+    await request(`/api/v1/projects/${id}`, { method: "DELETE" });
+}
+export async function listCardTypes(projectId) {
+    const r = await request("/api/v1/card-types", {
+        query: { projectId },
+    });
+    return r.cardTypes;
+}
+export async function listTemplates(params) {
+    const r = await request("/api/v1/templates", {
+        query: params,
+    });
+    return r.templates;
+}
+export async function getTemplate(id) {
+    const r = await request(`/api/v1/templates/${id}`);
+    return r.template;
+}
+export async function updateTemplateContent(id, content) {
+    const r = await request(`/api/v1/templates/${id}`, {
+        method: "PATCH",
+        body: { contentJson: content },
+    });
+    return r.template;
+}
+export async function createTemplate(input) {
+    const r = await request("/api/v1/templates", {
+        method: "POST",
+        body: input,
+    });
+    return r.template;
+}
+// ---------------------------------------------------------------------------
+// Keywords (sec 25)
+// ---------------------------------------------------------------------------
+export async function listKeywords(params) {
+    const r = await request("/api/v1/keywords", { query: params });
+    return r.keywords;
+}
+export async function createKeyword(input) {
+    const r = await request("/api/v1/keywords", {
+        method: "POST",
+        body: input,
+    });
+    return r.keyword;
+}
+export async function updateKeyword(id, patch) {
+    const r = await request(`/api/v1/keywords/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.keyword;
+}
+export async function deleteKeyword(id) {
+    await request(`/api/v1/keywords/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Factions (sec 28)
+// ---------------------------------------------------------------------------
+export async function listFactions(params) {
+    const r = await request("/api/v1/factions", { query: params });
+    return r.factions;
+}
+export async function createFaction(input) {
+    const r = await request("/api/v1/factions", {
+        method: "POST",
+        body: input,
+    });
+    return r.faction;
+}
+export async function updateFaction(id, patch) {
+    const r = await request(`/api/v1/factions/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.faction;
+}
+export async function deleteFaction(id) {
+    await request(`/api/v1/factions/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Blocks (sec 27.3)
+// ---------------------------------------------------------------------------
+export async function listBlocks(params) {
+    const r = await request("/api/v1/blocks", { query: params });
+    return r.blocks;
+}
+export async function createBlock(input) {
+    const r = await request("/api/v1/blocks", {
+        method: "POST",
+        body: input,
+    });
+    return r.block;
+}
+export async function updateBlock(id, patch) {
+    const r = await request(`/api/v1/blocks/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.block;
+}
+export async function deleteBlock(id) {
+    await request(`/api/v1/blocks/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Lore (sec 29)
+// ---------------------------------------------------------------------------
+export async function listLore(params) {
+    const r = await request("/api/v1/lore", { query: params });
+    return r.lore;
+}
+export async function createLore(input) {
+    const r = await request("/api/v1/lore", {
+        method: "POST",
+        body: input,
+    });
+    return r.lore;
+}
+export async function updateLore(id, patch) {
+    const r = await request(`/api/v1/lore/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.lore;
+}
+export async function deleteLore(id) {
+    await request(`/api/v1/lore/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Decks (sec 30)
+// ---------------------------------------------------------------------------
+export async function listDecks(params) {
+    const r = await request("/api/v1/decks", { query: params });
+    return r.decks;
+}
+export async function getDeck(id) {
+    const r = await request(`/api/v1/decks/${id}`);
+    return r.deck;
+}
+export async function createDeck(input) {
+    const r = await request("/api/v1/decks", {
+        method: "POST",
+        body: input,
+    });
+    return r.deck;
+}
+export async function updateDeck(id, patch) {
+    const r = await request(`/api/v1/decks/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.deck;
+}
+export async function deleteDeck(id) {
+    await request(`/api/v1/decks/${id}`, { method: "DELETE" });
+}
+/**
+ * Bulk replace the deck's card list. Idempotent on the server side —
+ * existing slots are wiped and the new list is reinserted in one
+ * transaction. Use this from the deck editor's "Save" button.
+ */
+export async function replaceDeckCards(id, cards) {
+    return request(`/api/v1/decks/${id}/cards`, {
+        method: "PUT",
+        body: { cards },
+    });
+}
+// ---------------------------------------------------------------------------
+// Boards (sec 26)
+// ---------------------------------------------------------------------------
+export async function listBoards(params) {
+    const r = await request("/api/v1/boards", { query: params });
+    return r.boards;
+}
+export async function getBoard(id) {
+    const r = await request(`/api/v1/boards/${id}`);
+    return r.board;
+}
+export async function createBoard(input) {
+    const r = await request("/api/v1/boards", {
+        method: "POST",
+        body: input,
+    });
+    return r.board;
+}
+export async function updateBoard(id, patch) {
+    const r = await request(`/api/v1/boards/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.board;
+}
+export async function deleteBoard(id) {
+    await request(`/api/v1/boards/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Card types
+// ---------------------------------------------------------------------------
+export async function createCardType(input) {
+    const r = await request("/api/v1/card-types", {
+        method: "POST",
+        body: input,
+    });
+    return r.cardType;
+}
+export async function updateCardType(id, patch) {
+    const r = await request(`/api/v1/card-types/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.cardType;
+}
+export async function deleteCardType(id) {
+    await request(`/api/v1/card-types/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Sets (sec 27)
+// ---------------------------------------------------------------------------
+export async function listSets(params) {
+    const r = await request("/api/v1/sets", { query: params });
+    return r.sets;
+}
+export async function createSet(input) {
+    const r = await request("/api/v1/sets", {
+        method: "POST",
+        body: input,
+    });
+    return r.set;
+}
+export async function updateSet(id, patch) {
+    const r = await request(`/api/v1/sets/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.set;
+}
+export async function deleteSet(id) {
+    await request(`/api/v1/sets/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Cards
+// ---------------------------------------------------------------------------
+export async function listCards(params) {
+    const r = await request("/api/v1/cards", { query: params });
+    return r.cards;
+}
+export async function createCard(input) {
+    const r = await request("/api/v1/cards", {
+        method: "POST",
+        body: input,
+    });
+    return r.card;
+}
+export async function updateCardData(id, patch) {
+    const r = await request(`/api/v1/cards/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.card;
+}
+export async function deleteCard(id) {
+    await request(`/api/v1/cards/${id}`, { method: "DELETE" });
+}
+// ---------------------------------------------------------------------------
+// Assets
+// ---------------------------------------------------------------------------
+export async function listAssets(params) {
+    const r = await request("/api/v1/assets", { query: params });
+    return r.assets;
+}
+/**
+ * Upload a file to the assets endpoint via multipart/form-data. We bypass the
+ * shared `request()` helper here because that one always sends JSON; the
+ * upload route needs a real FormData body so the boundary header is correct.
+ */
+export async function uploadAsset(input) {
+    const fd = new FormData();
+    fd.append("file", input.file, input.file.name);
+    if (input.projectId)
+        fd.append("projectId", input.projectId);
+    if (input.name)
+        fd.append("name", input.name);
+    if (input.type)
+        fd.append("type", input.type);
+    const url = new URL("/api/v1/assets/upload", API_BASE);
+    const uploadHeaders = { "X-Tenant-Slug": _tenantSlug };
+    if (_authToken)
+        uploadHeaders["Authorization"] = `Bearer ${_authToken}`;
+    const response = await fetch(url.toString(), {
+        method: "POST",
+        headers: uploadHeaders,
+        body: fd,
+    });
+    const text = await response.text();
+    const parsed = text ? safeParseJson(text) : undefined;
+    if (!response.ok) {
+        throw new ApiError(response.status, `${response.status} ${response.statusText} — ${parsed?.message ??
+            parsed?.error ??
+            "upload failed"}`, parsed);
+    }
+    return parsed.asset;
+}
+export async function deleteAsset(id) {
+    await request(`/api/v1/assets/${id}`, { method: "DELETE" });
+}
+export async function getAsset(id) {
+    const r = await request(`/api/v1/assets/${id}`);
+    return r.asset;
+}
+export async function updateAsset(id, patch) {
+    const r = await request(`/api/v1/assets/${id}`, {
+        method: "PATCH",
+        body: patch,
+    });
+    return r.asset;
+}
+/** Browser-resolvable URL for an asset's bytes. Used as <img src> / Konva.Image source. */
+export function assetBlobUrl(id) {
+    if (!id || id === "null" || id === "undefined")
+        return "";
+    // If we definitely don't have a token yet (or it looks invalid), don't even
+    // try to hit the API — it will just 401. This prevents console noise during
+    // boot or after logout.
+    if (!_authToken || !_authToken.includes("."))
+        return "";
+    const url = new URL(`${API_BASE}/api/v1/assets/${id}/blob`);
+    url.searchParams.set("tenant", _tenantSlug);
+    url.searchParams.set("token", _authToken);
+    return url.toString();
+}
+/**
+ * Resolves a reliable source URL for an image layer.
+ * Internal asset URLs are automatically refreshed with the latest
+ * auth token and tenant slug to prevent 401/404 errors.
+ */
+export function resolveAssetUrl(layer, data = {}, 
+/**
+ * Optional override for "asset id → URL". The public gallery passes a
+ * tenant-slug-aware resolver here so frame art / card art route
+ * through the unauthenticated public asset endpoint instead of the
+ * auth-token-protected `/api/v1/assets/:id/blob`. Defaults to the
+ * authenticated `assetBlobUrl` for the editor.
+ */
+resolveId) {
+    const idResolver = resolveId ?? assetBlobUrl;
+    let idOrUrl = null;
+    if (layer.fieldKey) {
+        const v = data[layer.fieldKey];
+        if (typeof v === "string" && v.trim() !== "" && v !== "null" && v !== "undefined")
+            idOrUrl = v;
+    }
+    if (!idOrUrl && layer.assetId && layer.assetId !== "null" && layer.assetId !== "undefined") {
+        idOrUrl = layer.assetId;
+    }
+    if (!idOrUrl && layer.src && layer.src !== "null" && layer.src !== "undefined") {
+        idOrUrl = layer.src;
+    }
+    if (!idOrUrl)
+        return null;
+    // Known internal asset URL — extract the id and let the resolver
+    // produce a fresh URL (so a stale auth token in the original URL
+    // doesn't leak into the rendered output).
+    const assetIdMatch = idOrUrl.match(/\/api\/v[01]\/assets\/([^/?#]+)\/blob/);
+    if (assetIdMatch) {
+        return idResolver(assetIdMatch[1]);
+    }
+    // Public asset URL — also extract the id so re-renders pick up the
+    // active tenant slug correctly.
+    const publicMatch = idOrUrl.match(/\/api\/public\/[^/]+\/assets\/([^/?#]+)\/blob/);
+    if (publicMatch) {
+        return idResolver(publicMatch[1]);
+    }
+    // Raw ID (no protocol / slashes) — treat as an asset id.
+    if (!/^(https?:|data:|blob:|\/)/.test(idOrUrl)) {
+        return idResolver(idOrUrl);
+    }
+    return idOrUrl;
+}
+export const apiHealth = {
+    base: API_BASE,
+    /** Reads through to the live mutable so callers always see the current tenant. */
+    get tenantSlug() {
+        return _tenantSlug;
+    },
+};

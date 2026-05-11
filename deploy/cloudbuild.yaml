@@ -1,0 +1,40 @@
+steps:
+  # 1. Build the API image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/api:${_TAG}'
+      - '-f'
+      - 'apps/api/Dockerfile'
+      - '--target'
+      - 'prod'
+      - '.'
+
+  # 2. Build the Designer image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/designer:${_TAG}'
+      - '-f'
+      - 'apps/designer/Dockerfile'
+      - '--target'
+      - 'prod'
+      - '.'
+
+  # 3. Push images to Artifact Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/api:${_TAG}']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/designer:${_TAG}']
+
+images:
+  - '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/api:${_TAG}'
+  - '${_REGION}-docker.pkg.dev/${_PROJECT_ID}/${_REPOSITORY}/designer:${_TAG}'
+
+substitutions:
+  _REGION: us-central1
+  _REPOSITORY: tcgstudio
+  _TAG: latest
+  _PROJECT_ID: PLACEHOLDER

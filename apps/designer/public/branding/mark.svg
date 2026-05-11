@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Compact square mark — derived from logo.svg's center crystal motif.
+  Used in places that can't fit the full banner (favicon, tiny header).
+  Same gradient stops as the full logo so the brand reads consistently.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="TCGStudio mark">
+  <defs>
+    <linearGradient id="mPlate" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071328"/>
+      <stop offset="0.44" stop-color="#092e64"/>
+      <stop offset="1" stop-color="#020713"/>
+    </linearGradient>
+    <linearGradient id="mCard" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d57ff"/>
+      <stop offset="0.5" stop-color="#052a83"/>
+      <stop offset="1" stop-color="#02091b"/>
+    </linearGradient>
+    <linearGradient id="mSilver" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.45" stop-color="#e9f2ff"/>
+      <stop offset="0.55" stop-color="#6f819a"/>
+      <stop offset="1" stop-color="#f7fbff"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="188" height="188" rx="36" fill="url(#mPlate)" stroke="#001024" stroke-width="6"/>
+  <rect x="14" y="14" width="172" height="172" rx="30" fill="none" stroke="#0a91ff" stroke-width="2" opacity="0.5"/>
+  <circle cx="100" cy="100" r="62" fill="none" stroke="#020716" stroke-width="6"/>
+  <circle cx="100" cy="100" r="55" fill="none" stroke="#e9fbff" stroke-width="3"/>
+  <circle cx="100" cy="100" r="47" fill="none" stroke="#00d9ff" stroke-width="2"/>
+  <path d="M100 30 L116 90 L180 100 L116 110 L100 170 L84 110 L20 100 L84 90 Z"
+        fill="url(#mSilver)" stroke="#001329" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M100 30 L103 95 L180 100 L103 105 L100 170 L97 105 L20 100 L97 95 Z"
+        fill="#00ebff" opacity="0.9"/>
+</svg>

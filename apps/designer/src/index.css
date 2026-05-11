@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ----- Studio shell base styles ----- */
+
+:root {
+  color-scheme: dark;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: #0b0d10;
+  color: #e6e9ee;
+}
+
+/* Scrollbars in panels — slim, neutral. */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+/* Buttons / inputs default reset for the studio chrome. */
+button {
+  font: inherit;
+  color: inherit;
+}
+
+/* Hide the default focus ring; we draw our own with Tailwind ring classes. */
+button:focus,
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+}

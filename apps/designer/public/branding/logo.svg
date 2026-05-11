@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="801" height="590" viewBox="0 0 801 590" role="img" aria-label="TCGStudio logo">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071328"/>
+      <stop offset="0.44" stop-color="#092e64"/>
+      <stop offset="1" stop-color="#020713"/>
+    </linearGradient>
+    <linearGradient id="cardBlue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0d57ff"/>
+      <stop offset="0.5" stop-color="#052a83"/>
+      <stop offset="1" stop-color="#02091b"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#00fff0"/>
+      <stop offset="1" stop-color="#14a7ff"/>
+    </linearGradient>
+    <linearGradient id="silver" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.45" stop-color="#e9f2ff"/>
+      <stop offset="0.55" stop-color="#6f819a"/>
+      <stop offset="1" stop-color="#f7fbff"/>
+    </linearGradient>
+    <filter id="blueGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="0 0 0 0 0  0 0 0 0 0.65  0 0 0 0 1  0 0 0 0.85 0" result="glow"/>
+      <feMerge><feMergeNode in="glow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="hardShadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3" result="blur"/>
+      <feOffset in="blur" dx="0" dy="5" result="offsetBlur"/>
+      <feFlood flood-color="#000000" flood-opacity="0.95" result="shadowColor"/>
+      <feComposite in="shadowColor" in2="offsetBlur" operator="in" result="shadow"/>
+      <feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .outer { fill:none; stroke:#001024; stroke-width:18; stroke-linejoin:round; }
+      .white { fill:none; stroke:#f4fbff; stroke-width:5; stroke-linejoin:round; }
+      .blue { fill:none; stroke:#009dff; stroke-width:3; stroke-linejoin:round; }
+      .cyanLine { fill:none; stroke:#00f0ff; stroke-width:2; stroke-linejoin:round; }
+      .cut { fill:none; stroke:#0e72ff; stroke-width:1.6; opacity:.65; }
+      .word { font-family: Lato, 'Arial Black', Impact, sans-serif; font-style: italic; font-weight:900; letter-spacing:-6px; paint-order:stroke fill; stroke:#05070d; stroke-width:7px; stroke-linejoin:round; }
+    </style>
+  </defs>
+
+  <g filter="url(#blueGlow)">
+    <path d="M160 145 L330 62 L432 392 L246 411 Z" fill="url(#cardBlue)" stroke="#020716" stroke-width="18" stroke-linejoin="round"/>
+    <path d="M160 145 L330 62 L432 392 L246 411 Z" class="white"/>
+    <path d="M183 160 L322 88 L401 361 L255 378 Z" class="blue"/>
+    <path d="M642 145 L472 62 L370 392 L556 411 Z" fill="url(#cardBlue)" stroke="#020716" stroke-width="18" stroke-linejoin="round"/>
+    <path d="M642 145 L472 62 L370 392 L556 411 Z" class="white"/>
+    <path d="M619 160 L480 88 L401 361 L547 378 Z" class="blue"/>
+
+    <path d="M291 24 H510 Q532 24 532 48 V338 Q532 362 508 362 H293 Q269 362 269 338 V48 Q269 24 291 24 Z" fill="url(#cardBlue)" stroke="#020716" stroke-width="18"/>
+    <path d="M291 24 H510 Q532 24 532 48 V338 Q532 362 508 362 H293 Q269 362 269 338 V48 Q269 24 291 24 Z" class="white"/>
+    <path d="M301 57 L334 28 H468 L501 57 V316 L468 344 H334 L301 316 Z" fill="#061c5e" stroke="#00b5ff" stroke-width="3"/>
+    <path d="M326 93 H476 M326 303 H476 M318 121 L303 138 M484 121 L500 138 M318 276 L303 258 M484 276 L500 258" class="cut"/>
+
+    <circle cx="401" cy="197" r="84" fill="none" stroke="#020716" stroke-width="9"/>
+    <circle cx="401" cy="197" r="75" fill="none" stroke="#e9fbff" stroke-width="4"/>
+    <circle cx="401" cy="197" r="64" fill="none" stroke="#00d9ff" stroke-width="3"/>
+    <circle cx="401" cy="197" r="49" fill="none" stroke="#04112e" stroke-width="8"/>
+    <path d="M401 78 L426 172 L520 197 L426 222 L401 316 L376 222 L282 197 L376 172 Z" fill="url(#silver)" stroke="#001329" stroke-width="6" stroke-linejoin="round"/>
+    <path d="M401 78 L406 192 L520 197 L406 202 L401 316 L396 202 L282 197 L396 192 Z" fill="#00ebff" opacity=".9"/>
+  </g>
+
+  <g filter="url(#hardShadow)">
+    <path d="M37 342 L68 310 H733 L766 342 L733 464 H68 L37 430 Z" fill="url(#plate)" stroke="#020716" stroke-width="18" stroke-linejoin="round"/>
+    <path d="M37 342 L68 310 H733 L766 342 L733 464 H68 L37 430 Z" class="white"/>
+    <path d="M62 351 L84 329 H716 L739 351 L718 443 H84 L62 421 Z" fill="none" stroke="#0a91ff" stroke-width="3" stroke-linejoin="round"/>
+    <path d="M80 362 H722" stroke="#122e62" stroke-width="10" opacity=".35"/>
+
+    <text x="79" y="424" font-size="82" class="word" fill="#00f0ff">Tcg</text>
+    <text x="327" y="424" font-size="82" class="word" fill="url(#silver)" letter-spacing="-4">Studio</text>
+    <path d="M96 445 H291 L284 459 H89 Z" fill="#20ff41" opacity=".85"/>
+    <path d="M75 357 H130 L119 371 H72 Z" fill="#ff1717" opacity=".9"/>
+  </g>
+
+  <g filter="url(#blueGlow)">
+    <path d="M309 476 L402 576 L493 476 L402 530 Z" fill="#03102a" stroke="#001021" stroke-width="12" stroke-linejoin="round"/>
+    <path d="M329 481 L402 558 L472 481 L402 516 Z" fill="none" stroke="#00d5ff" stroke-width="3"/>
+    <path d="M402 506 L431 478 L402 467 L372 478 Z" fill="url(#cyan)" stroke="#eafdff" stroke-width="2"/>
+  </g>
+</svg>

@@ -1,0 +1,130 @@
+# TCGStudio production stack — runs on a single GCE VM via docker-compose.
+#
+# Differences from the dev compose:
+#   • Uses the `prod` build targets (compiled API + nginx-served SPA bundle)
+#     instead of dev servers with bind mounts. Smaller, faster, lighter on
+#     RAM — important when the host VM is an e2-micro.
+#   • No volume mounts of source — the image IS the artifact.
+#   • Exposes only the designer on :80 (public) and API on :4000 (public, for
+#     direct API calls from the SPA). Postgres + MinIO + Redis bind to the
+#     internal docker network only.
+#   • Secrets come from a .env file living next to this compose file.
+#
+# Bring up:  docker compose -f docker-compose.prod.yml up -d --build
+# Logs:      docker compose -f docker-compose.prod.yml logs -f
+# Tear down: docker compose -f docker-compose.prod.yml down
+#
+# After first boot, run the Prisma migrations:
+#   docker compose -f docker-compose.prod.yml exec api npx prisma migrate deploy
+
+name: tcgstudio
+
+services:
+  designer:
+    build:
+      context: ..
+      dockerfile: apps/designer/Dockerfile
+      target: prod
+    image: tcgstudio/designer:prod
+    container_name: tcgstudio-designer
+    restart: unless-stopped
+    depends_on:
+      - api
+    # nginx template substitutes VITE_API_URL into the SPA bundle's __TCG_API_URL__
+    # sentinel — set this to the public API origin the browser will hit.
+    environment:
+      VITE_API_URL: "${PUBLIC_API_URL:-http://localhost:4000}"
+      PORT: "80"
+    ports:
+      - "80:80"
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+      target: prod
+    image: tcgstudio/api:prod
+    container_name: tcgstudio-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: "0.0.0.0"
+      PORT: "4000"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-tcg}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-tcgstudio}?schema=public"
+      # Allow the public designer origin plus localhost during smoke tests.
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost,http://127.0.0.1}"
+      JWT_SECRET: "${JWT_SECRET}"
+      DEFAULT_TENANT_SLUG: "demo"
+      MINIO_ENDPOINT: "minio"
+      MINIO_PORT: "9000"
+      MINIO_USE_SSL: "false"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER:-tcg}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD}"
+      MINIO_BUCKET: "tcgstudio"
+    ports:
+      - "4000:4000"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tcgstudio-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tcg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-tcgstudio}
+    # Tighter shared_buffers to fit on a 1 GB VM. Default 128MB is too much.
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=64MB"
+      - "-c"
+      - "max_connections=50"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tcg} -d ${POSTGRES_DB:-tcgstudio}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: tcgstudio-redis
+    restart: unless-stopped
+    # No AOF + tight maxmemory keeps redis under 32 MB resident.
+    command: ["redis-server", "--maxmemory", "32mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: tcgstudio-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-tcg}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

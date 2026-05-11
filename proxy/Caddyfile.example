@@ -1,0 +1,64 @@
+# Caddyfile — sample reverse proxy + on-demand TLS for TCGStudio.
+#
+# Drop this in front of the API + designer (typically port 4000 +
+# 5173) so tenants' custom domains terminate TLS through Caddy and
+# get routed to the right backend by Host header.
+#
+# Three things make this work:
+#
+#   1. The platform's own root domain ({$ROOT_DOMAIN}) — has a real
+#      wildcard cert in production; here we use Caddy's automatic
+#      issuance. Subdomains under this root resolve to the right
+#      tenant inside the API via Host parsing.
+#
+#   2. Tenant custom domains — anything else. We use on_demand TLS
+#      so Caddy issues a cert the FIRST TIME a request comes in for
+#      that hostname. Caddy calls `ask` against our API to make sure
+#      the hostname is actually claimed by an active tenant before
+#      issuing — this is required to avoid burning Let's Encrypt
+#      rate limit on attackers pointing arbitrary DNS at us.
+#
+#   3. The "ask" endpoint authenticates with PROXY_HOOK_TOKEN.
+#      Set the same value in both Caddy's env and the API's env.
+#
+# Run with:
+#   docker run -d -p 80:80 -p 443:443 \
+#     -e ROOT_DOMAIN=tcgstudio.local \
+#     -e PROXY_HOOK_TOKEN=$(openssl rand -hex 24) \
+#     -v $PWD/Caddyfile:/etc/caddy/Caddyfile \
+#     caddy:2
+
+{
+	# Where Caddy goes to ask whether a hostname is allowed.
+	# Replace `api:4000` with your API's reachable hostname:port.
+	on_demand_tls {
+		ask http://api:4000/api/internal/domain-allowed?token={$PROXY_HOOK_TOKEN}
+	}
+	# Real cert issuance — replace with your operator email.
+	email ops@tcgstudio.local
+}
+
+# Platform root + any *.tcgstudio.local subdomain.
+*.{$ROOT_DOMAIN}, {$ROOT_DOMAIN} {
+	tls {
+		# In dev, comment this out and let Caddy use its internal CA.
+		# In prod, this is your wildcard cert (DNS-01 challenge).
+		# dns cloudflare {$CLOUDFLARE_API_TOKEN}
+	}
+	reverse_proxy api:4000
+}
+
+# Catch-all for tenant custom domains. Matches every Host that the
+# blocks above didn't match. Caddy gates issuance through the
+# `on_demand` directive so we never issue for unclaimed hosts.
+:443 {
+	tls {
+		on_demand
+	}
+	reverse_proxy api:4000
+}
+
+# HTTP → HTTPS redirect for everything.
+:80 {
+	redir https://{host}{uri} permanent
+}

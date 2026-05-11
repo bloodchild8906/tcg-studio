@@ -1,0 +1,413 @@
+import { jsx as _jsx, jsxs as _jsxs } from "react/jsx-runtime";
+import { useCallback, useEffect, useState } from "react";
+import { useDesigner } from "@/store/designerStore";
+import { apiHealth, assetBlobUrl, inviteMember, listMemberships, removeMembership, updateMembershipRole, updateTenant, } from "@/lib/api";
+import { useAssetPicker } from "@/components/AssetPicker";
+/**
+ * Settings view — tenant-scoped workspace management.
+ *
+ * The user wanted "everything of the tenant to be only inside the tenant",
+ * so the cross-tenant browse that used to live in the sidebar is gone. This
+ * view operates against the *current* tenant: rename, change status, view
+ * connection details. Switching to another tenant lives at the bottom (a
+ * less-prominent "Workspaces" section), and creating a new one is a deliberate
+ * action behind a small button.
+ *
+ * Layout, top to bottom:
+ *   1. This workspace — current tenant card with editable fields.
+ *   2. API connection — read-only base URL + active slug.
+ *   3. Other workspaces — collapsed list of every accessible tenant with
+ *      Switch buttons. "+ New workspace" button creates one.
+ *   4. Danger zone — delete current tenant (cascades).
+ */
+export function SettingsView() {
+    return (_jsx("div", { className: "overflow-y-auto bg-ink-950", children: _jsxs("div", { className: "mx-auto max-w-3xl space-y-6 p-8", children: [_jsxs("header", { children: [_jsx("p", { className: "text-[11px] uppercase tracking-wider text-ink-400", children: "Workspace" }), _jsx("h1", { className: "mt-1 text-2xl font-semibold text-ink-50", children: "Settings" }), _jsx("p", { className: "mt-1 text-xs text-ink-400", children: "Manage the active workspace and its connection. Branding, billing, and members land in later iterations." })] }), _jsx(AccountSection, {}), _jsx(CurrentWorkspace, {}), _jsx(MembersSection, {}), _jsx(BrandSection, {}), _jsx(ApiInfo, {}), _jsx(OtherWorkspaces, {}), _jsx(DangerZone, {})] }) }));
+}
+/* ---------------------------------------------------------------------- */
+/* Account (auth)                                                         */
+/* ---------------------------------------------------------------------- */
+function AccountSection() {
+    const currentUser = useDesigner((s) => s.currentUser);
+    const memberships = useDesigner((s) => s.memberships);
+    const signOut = useDesigner((s) => s.signOut);
+    if (!currentUser) {
+        return (_jsxs(Section, { title: "Account", subtitle: "not signed in", children: [_jsx("p", { className: "text-[11px] text-ink-500", children: "Sign in to bind your changes to a real user. Until you do, anyone with the tenant slug can hit the API and act as you." }), _jsx(AuthForm, {})] }));
+    }
+    return (_jsxs(Section, { title: "Account", subtitle: "signed in", children: [_jsx(FieldRow, { label: "Email", children: _jsx(Code, { children: currentUser.email }) }), _jsx(FieldRow, { label: "Name", children: _jsx(Code, { children: currentUser.name }) }), _jsx(FieldRow, { label: "User ID", children: _jsx(Code, { children: currentUser.id }) }), _jsx(FieldRow, { label: "Memberships", children: _jsxs("ul", { className: "space-y-1 rounded border border-ink-800 bg-ink-900/40 p-2", children: [memberships.map((m) => (_jsxs("li", { className: "flex items-center justify-between gap-2 text-[11px]", children: [_jsx("span", { className: "text-ink-200", children: m.tenant.name }), _jsxs("span", { className: "text-ink-500", children: [_jsx("code", { className: "font-mono", children: m.tenant.slug }), " \u00B7 ", m.role] })] }, m.id))), memberships.length === 0 && (_jsx("li", { className: "text-[11px] text-ink-500", children: "No memberships yet." }))] }) }), _jsx("div", { className: "flex justify-end border-t border-ink-800 pt-3", children: _jsx("button", { type: "button", onClick: signOut, className: "rounded border border-ink-700 bg-ink-800 px-3 py-1.5 text-xs text-ink-100 hover:bg-ink-700", children: "Sign out" }) })] }));
+}
+function AuthForm() {
+    const signIn = useDesigner((s) => s.signIn);
+    const signUp = useDesigner((s) => s.signUp);
+    const [mode, setMode] = useState("signin");
+    const [email, setEmail] = useState("");
+    const [password, setPassword] = useState("");
+    const [name, setName] = useState("");
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState(null);
+    async function submit(e) {
+        e.preventDefault();
+        setError(null);
+        setBusy(true);
+        try {
+            if (mode === "signin") {
+                await signIn({ email, password });
+            }
+            else {
+                await signUp({ email, password, name });
+            }
+        }
+        catch (err) {
+            setError(err instanceof Error ? err.message : "auth failed");
+        }
+        finally {
+            setBusy(false);
+        }
+    }
+    return (_jsxs("form", { onSubmit: submit, className: "mt-3 space-y-2 rounded border border-ink-800 bg-ink-900/40 p-3", children: [_jsxs("div", { className: "flex gap-1", children: [_jsx("button", { type: "button", onClick: () => setMode("signin"), className: [
+                            "flex-1 rounded px-2 py-1 text-[11px] uppercase tracking-wider",
+                            mode === "signin"
+                                ? "bg-accent-500/15 text-accent-300"
+                                : "text-ink-400 hover:bg-ink-800",
+                        ].join(" "), children: "Sign in" }), _jsx("button", { type: "button", onClick: () => setMode("signup"), className: [
+                            "flex-1 rounded px-2 py-1 text-[11px] uppercase tracking-wider",
+                            mode === "signup"
+                                ? "bg-accent-500/15 text-accent-300"
+                                : "text-ink-400 hover:bg-ink-800",
+                        ].join(" "), children: "Sign up" })] }), mode === "signup" && (_jsx(FieldRow, { label: "Name", children: _jsx("input", { type: "text", value: name, onChange: (e) => setName(e.target.value), className: "block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100" }) })), _jsx(FieldRow, { label: "Email", children: _jsx("input", { type: "email", value: email, onChange: (e) => setEmail(e.target.value), autoComplete: mode === "signin" ? "email" : "email", className: "block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100" }) }), _jsx(FieldRow, { label: "Password", hint: "Min 8 characters.", children: _jsx("input", { type: "password", value: password, onChange: (e) => setPassword(e.target.value), minLength: mode === "signup" ? 8 : 1, autoComplete: mode === "signin" ? "current-password" : "new-password", className: "block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100" }) }), error && (_jsx("p", { className: "rounded border border-danger-500/30 bg-danger-500/10 px-2 py-1 text-[11px] text-danger-500", children: error })), _jsxs("div", { className: "flex items-center justify-between gap-3", children: [_jsx("p", { className: "text-[10px] text-ink-500", children: mode === "signup"
+                            ? "We'll auto-create a personal workspace for you."
+                            : "Sign in to an existing account." }), _jsx("button", { type: "submit", disabled: busy || !email || !password || (mode === "signup" && !name), className: "rounded border border-accent-500/40 bg-accent-500/15 px-3 py-1.5 text-xs font-medium text-accent-300 hover:border-accent-500/70 hover:bg-accent-500/25 disabled:cursor-not-allowed disabled:border-ink-700 disabled:bg-ink-800 disabled:text-ink-500", children: busy ? "…" : mode === "signin" ? "Sign in" : "Create account" })] })] }));
+}
+/* ---------------------------------------------------------------------- */
+/* Current workspace                                                      */
+/* ---------------------------------------------------------------------- */
+function CurrentWorkspace() {
+    const tenants = useDesigner((s) => s.tenants);
+    const activeSlug = useDesigner((s) => s.activeTenantSlug);
+    const tenant = tenants.find((t) => t.slug === activeSlug) ?? null;
+    const [name, setName] = useState(tenant?.name ?? "");
+    const [status, setStatus] = useState(tenant?.status ?? "active");
+    const [saving, setSaving] = useState(false);
+    const [error, setError] = useState(null);
+    const [savedTick, setSavedTick] = useState(false);
+    // Reset when the active tenant changes (switch workspace).
+    useEffect(() => {
+        if (!tenant)
+            return;
+        setName(tenant.name);
+        setStatus(tenant.status);
+    }, [tenant?.id, tenant?.name, tenant?.status]);
+    if (!tenant) {
+        return (_jsx(Section, { title: "This workspace", children: _jsx("p", { className: "text-xs text-ink-500", children: "No active tenant. Pick or create one below." }) }));
+    }
+    const dirty = name !== tenant.name || status !== tenant.status;
+    async function save() {
+        if (!tenant || !dirty)
+            return;
+        setSaving(true);
+        setError(null);
+        try {
+            const updated = await updateTenant(tenant.id, { name, status });
+            // Update the local tenants array so the header / picker reflect it.
+            useDesigner.setState((s) => ({
+                tenants: s.tenants.map((t) => (t.id === updated.id ? updated : t)),
+            }));
+            setSavedTick(true);
+            setTimeout(() => setSavedTick(false), 1200);
+        }
+        catch (err) {
+            setError(err instanceof Error ? err.message : "save failed");
+        }
+        finally {
+            setSaving(false);
+        }
+    }
+    return (_jsxs(Section, { title: "This workspace", children: [_jsx(FieldRow, { label: "Name", children: _jsx("input", { type: "text", value: name, onChange: (e) => setName(e.target.value), className: "block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40" }) }), _jsx(FieldRow, { label: "Slug", hint: "Cannot be changed in this UI; lives in the API headers and URL prefixes.", children: _jsx(Code, { children: tenant.slug }) }), _jsx(FieldRow, { label: "Tenant ID", hint: "Stable identifier for API calls.", children: _jsx(Code, { children: tenant.id }) }), _jsx(FieldRow, { label: "Status", children: _jsx("select", { value: status, onChange: (e) => setStatus(e.target.value), className: "block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40", children: [
+                        "trial",
+                        "active",
+                        "past_due",
+                        "suspended",
+                        "disabled",
+                        "pending_deletion",
+                    ].map((s) => (_jsx("option", { value: s, children: s }, s))) }) }), _jsxs("div", { className: "flex items-center justify-end gap-2 border-t border-ink-800 pt-3", children: [error && _jsx("span", { className: "mr-auto text-[11px] text-danger-500", children: error }), savedTick && (_jsx("span", { className: "mr-auto text-[11px] text-emerald-300", children: "Saved." })), _jsx("button", { type: "button", onClick: save, disabled: !dirty || saving, className: "rounded border border-accent-500/40 bg-accent-500/15 px-3 py-1.5 text-xs font-medium text-accent-300 hover:border-accent-500/70 hover:bg-accent-500/25 disabled:cursor-not-allowed disabled:border-ink-700 disabled:bg-ink-800 disabled:text-ink-500", children: saving ? "Saving…" : "Save changes" })] })] }));
+}
+/* ---------------------------------------------------------------------- */
+/* Members                                                                */
+/* ---------------------------------------------------------------------- */
+const ROLE_OPTIONS = [
+    "tenant_owner",
+    "tenant_admin",
+    "billing_admin",
+    "brand_manager",
+    "domain_manager",
+    "plugin_manager",
+    "security_admin",
+    "audit_viewer",
+    "project_creator",
+    "viewer",
+];
+function MembersSection() {
+    const tenants = useDesigner((s) => s.tenants);
+    const activeSlug = useDesigner((s) => s.activeTenantSlug);
+    const tenant = tenants.find((t) => t.slug === activeSlug) ?? null;
+    const currentUser = useDesigner((s) => s.currentUser);
+    const [members, setMembers] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState(null);
+    const refresh = useCallback(async () => {
+        if (!tenant)
+            return;
+        setLoading(true);
+        setError(null);
+        try {
+            setMembers(await listMemberships());
+        }
+        catch (err) {
+            setError(err instanceof Error ? err.message : "load failed");
+        }
+        finally {
+            setLoading(false);
+        }
+    }, [tenant?.id]);
+    useEffect(() => {
+        void refresh();
+    }, [refresh]);
+    if (!tenant)
+        return null;
+    return (_jsxs(Section, { title: "Members", subtitle: `${members.length}`, children: [_jsxs("p", { className: "text-[11px] text-ink-500", children: ["Members of ", _jsx("code", { className: "font-mono", children: tenant.slug }), ". Invitees must already have a TCGStudio account \u2014 magic-link invites land in a future iteration."] }), error && (_jsx("p", { className: "rounded border border-danger-500/30 bg-danger-500/10 px-2 py-1 text-[11px] text-danger-500", children: error })), _jsx("ul", { className: "divide-y divide-ink-800 rounded border border-ink-800", children: loading && members.length === 0 ? (_jsx("li", { className: "py-3 text-center text-[11px] text-ink-500", children: "Loading\u2026" })) : members.length === 0 ? (_jsx("li", { className: "py-3 text-center text-[11px] text-ink-500", children: "No members yet." })) : (members.map((m) => (_jsx(MemberRow, { member: m, isSelf: currentUser?.id === m.userId, onRoleChange: async (role) => {
+                        try {
+                            const updated = await updateMembershipRole(m.id, role);
+                            setMembers((prev) => prev.map((x) => (x.id === updated.id ? updated : x)));
+                        }
+                        catch (err) {
+                            setError(err instanceof Error ? err.message : "role change failed");
+                        }
+                    }, onRemove: async () => {
+                        if (!confirm(`Remove ${m.user.email} from this tenant?`))
+                            return;
+                        try {
+                            await removeMembership(m.id);
+                            await refresh();
+                        }
+                        catch (err) {
+                            setError(err instanceof Error ? err.message : "remove failed");
+                        }
+                    } }, m.id)))) }), _jsx(InviteForm, { onInvited: (member) => setMembers((prev) => [...prev, member]), onError: setError })] }));
+}
+function MemberRow({ member, isSelf, onRoleChange, onRemove, }) {
+    return (_jsxs("li", { className: "flex items-center gap-3 px-3 py-2", children: [_jsx("div", { className: "flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-ink-800 font-medium uppercase text-ink-300", children: member.user.name.slice(0, 1) }), _jsxs("div", { className: "min-w-0 flex-1", children: [_jsxs("p", { className: "truncate text-xs font-medium text-ink-100", children: [member.user.name, isSelf && (_jsx("span", { className: "ml-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-1.5 text-[9px] uppercase tracking-wider text-emerald-300", children: "you" }))] }), _jsx("p", { className: "truncate text-[10px] text-ink-500", children: member.user.email })] }), _jsx("select", { value: member.role, onChange: (e) => onRoleChange(e.target.value), className: "rounded border border-ink-700 bg-ink-900 px-2 py-1 text-[11px] text-ink-100", children: ROLE_OPTIONS.map((r) => (_jsx("option", { value: r, children: r }, r))) }), _jsx("button", { type: "button", onClick: onRemove, title: "Remove member", className: "inline-flex h-7 w-7 items-center justify-center rounded text-ink-400 hover:bg-danger-500/10 hover:text-danger-500", children: "\u00D7" })] }));
+}
+function InviteForm({ onInvited, onError, }) {
+    const [email, setEmail] = useState("");
+    const [role, setRole] = useState("viewer");
+    const [busy, setBusy] = useState(false);
+    async function submit(e) {
+        e.preventDefault();
+        if (!email.trim())
+            return;
+        setBusy(true);
+        onError("");
+        try {
+            const m = await inviteMember({ email: email.trim().toLowerCase(), role });
+            onInvited(m);
+            setEmail("");
+        }
+        catch (err) {
+            onError(err instanceof Error ? err.message : "invite failed");
+        }
+        finally {
+            setBusy(false);
+        }
+    }
+    return (_jsxs("form", { onSubmit: submit, className: "grid grid-cols-[1fr_140px_auto] items-center gap-2 border-t border-ink-800 pt-3", children: [_jsx("input", { type: "email", value: email, onChange: (e) => setEmail(e.target.value), placeholder: "someone@example.com", className: "rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100" }), _jsx("select", { value: role, onChange: (e) => setRole(e.target.value), className: "rounded border border-ink-700 bg-ink-900 px-2 py-1 text-[11px] text-ink-100", children: ROLE_OPTIONS.map((r) => (_jsx("option", { value: r, children: r }, r))) }), _jsx("button", { type: "submit", disabled: busy || !email.trim(), className: "rounded border border-accent-500/40 bg-accent-500/15 px-3 py-1.5 text-xs font-medium text-accent-300 hover:border-accent-500/70 hover:bg-accent-500/25 disabled:cursor-not-allowed disabled:border-ink-700 disabled:bg-ink-800 disabled:text-ink-500", children: busy ? "…" : "Invite" })] }));
+}
+/* ---------------------------------------------------------------------- */
+/* Brand                                                                  */
+/* ---------------------------------------------------------------------- */
+function BrandSection() {
+    const tenants = useDesigner((s) => s.tenants);
+    const activeSlug = useDesigner((s) => s.activeTenantSlug);
+    const tenant = tenants.find((t) => t.slug === activeSlug) ?? null;
+    const [productName, setProductName] = useState("");
+    const [accentColor, setAccentColor] = useState("");
+    const [logoAssetId, setLogoAssetId] = useState(null);
+    const [hidePlatformBranding, setHidePlatformBranding] = useState(false);
+    const [supportEmail, setSupportEmail] = useState("");
+    const [legalName, setLegalName] = useState("");
+    const [saving, setSaving] = useState(false);
+    const [error, setError] = useState(null);
+    const [savedTick, setSavedTick] = useState(false);
+    // Project-scoped asset picker. The tenant logo lives on the tenant, but
+    // the asset library itself is project-scoped (sec 20.3). The user picks
+    // a logo from whichever project is active in the header. Future iteration:
+    // an asset can be marked tenant-level and surface in a tenant-scoped picker.
+    const picker = useAssetPicker((asset) => setLogoAssetId(asset.id));
+    useEffect(() => {
+        if (!tenant)
+            return;
+        const b = tenant.brandingJson ?? {};
+        setProductName(typeof b.productName === "string" ? b.productName : "");
+        setAccentColor(typeof b.accentColor === "string" ? b.accentColor : "");
+        setLogoAssetId(typeof b.logoAssetId === "string" ? b.logoAssetId : null);
+        setHidePlatformBranding(b.hidePlatformBranding === true);
+        setSupportEmail(typeof b.supportEmail === "string" ? b.supportEmail : "");
+        setLegalName(typeof b.legalName === "string" ? b.legalName : "");
+    }, [tenant?.id, tenant?.updatedAt]);
+    if (!tenant)
+        return null;
+    const original = tenant.brandingJson ?? {};
+    const dirty = productName !== (original.productName ?? "") ||
+        accentColor !== (original.accentColor ?? "") ||
+        logoAssetId !== (typeof original.logoAssetId === "string" ? original.logoAssetId : null) ||
+        hidePlatformBranding !== (original.hidePlatformBranding === true) ||
+        supportEmail !== (original.supportEmail ?? "") ||
+        legalName !== (original.legalName ?? "");
+    async function save() {
+        if (!tenant || !dirty)
+            return;
+        setSaving(true);
+        setError(null);
+        try {
+            // Merge so unknown branding fields (future / plugin-added) survive.
+            const next = { ...(tenant.brandingJson ?? {}) };
+            // Strip empty strings so they aren't persisted as junk.
+            if (productName.trim())
+                next.productName = productName.trim();
+            else
+                delete next.productName;
+            if (accentColor.trim())
+                next.accentColor = accentColor.trim();
+            else
+                delete next.accentColor;
+            if (logoAssetId)
+                next.logoAssetId = logoAssetId;
+            else
+                delete next.logoAssetId;
+            if (hidePlatformBranding)
+                next.hidePlatformBranding = true;
+            else
+                delete next.hidePlatformBranding;
+            if (supportEmail.trim())
+                next.supportEmail = supportEmail.trim();
+            else
+                delete next.supportEmail;
+            if (legalName.trim())
+                next.legalName = legalName.trim();
+            else
+                delete next.legalName;
+            const updated = await updateTenant(tenant.id, { brandingJson: next });
+            useDesigner.setState((s) => ({
+                tenants: s.tenants.map((t) => (t.id === updated.id ? updated : t)),
+            }));
+            setSavedTick(true);
+            setTimeout(() => setSavedTick(false), 1200);
+        }
+        catch (err) {
+            setError(err instanceof Error ? err.message : "save failed");
+        }
+        finally {
+            setSaving(false);
+        }
+    }
+    return (_jsxs(Section, { title: "Brand", subtitle: "white-label", children: [_jsx(FieldRow, { label: "Logo", hint: "Replaces the platform mark in the header.", children: _jsxs("div", { className: "flex items-center gap-3", children: [_jsx("div", { className: "flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded border border-ink-700 bg-ink-900", children: _jsx("img", { src: logoAssetId ? assetBlobUrl(logoAssetId) : "/branding/mark.svg", alt: "", className: "max-h-full max-w-full object-contain" }) }), _jsx("button", { type: "button", onClick: picker.open, className: "rounded border border-ink-600 bg-ink-800 px-2.5 py-1.5 text-xs text-ink-100 hover:bg-ink-700", children: logoAssetId ? "Change…" : "Pick from assets…" }), logoAssetId && (_jsx("button", { type: "button", onClick: () => setLogoAssetId(null), className: "rounded border border-transparent px-2 py-1 text-[11px] text-ink-400 hover:border-ink-700 hover:bg-ink-800 hover:text-ink-100", title: "Reset to platform default", children: "Use default" })), picker.element] }) }), _jsx(FieldRow, { label: "Product name", hint: "Replaces 'TCGStudio' in the header.", children: _jsx("input", { type: "text", value: productName, onChange: (e) => setProductName(e.target.value), placeholder: "(use platform default)", maxLength: 60, className: "block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100 placeholder:text-ink-600 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40" }) }), _jsx(FieldRow, { label: "Accent color", hint: "Hex color used for active states + buttons.", children: _jsxs("div", { className: "flex items-center gap-2", children: [_jsx("input", { type: "color", value: normalizeHex(accentColor), onChange: (e) => setAccentColor(e.target.value), className: "h-7 w-9 cursor-pointer rounded border border-ink-700 bg-ink-900 p-0.5" }), _jsx("input", { type: "text", value: accentColor, placeholder: "#d4a24c", onChange: (e) => setAccentColor(e.target.value), className: "block flex-1 rounded border border-ink-700 bg-ink-900 px-2 py-1 font-mono text-xs text-ink-100 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40" })] }) }), _jsx(FieldRow, { label: "Support email", children: _jsx("input", { type: "email", value: supportEmail, onChange: (e) => setSupportEmail(e.target.value), placeholder: "support@studio.example", className: "block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100 placeholder:text-ink-600 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40" }) }), _jsx(FieldRow, { label: "Legal name", hint: "Used in card-footer copyright on PNG export.", children: _jsx("input", { type: "text", value: legalName, onChange: (e) => setLegalName(e.target.value), placeholder: "Studio Ltd.", className: "block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100 placeholder:text-ink-600 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40" }) }), _jsx(FieldRow, { label: "Hide platform", hint: "Drops the 'Designer' badge from the header.", children: _jsxs("label", { className: "inline-flex items-center gap-2 rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100", children: [_jsx("input", { type: "checkbox", checked: hidePlatformBranding, onChange: (e) => setHidePlatformBranding(e.target.checked), className: "h-3 w-3 cursor-pointer accent-accent-500" }), _jsx("span", { children: "White-label mode" })] }) }), _jsxs("div", { className: "flex items-center justify-end gap-2 border-t border-ink-800 pt-3", children: [error && _jsx("span", { className: "mr-auto text-[11px] text-danger-500", children: error }), savedTick && (_jsx("span", { className: "mr-auto text-[11px] text-emerald-300", children: "Saved." })), _jsx("button", { type: "button", onClick: save, disabled: !dirty || saving, className: "rounded border border-accent-500/40 bg-accent-500/15 px-3 py-1.5 text-xs font-medium text-accent-300 hover:border-accent-500/70 hover:bg-accent-500/25 disabled:cursor-not-allowed disabled:border-ink-700 disabled:bg-ink-800 disabled:text-ink-500", children: saving ? "Saving…" : "Save brand" })] })] }));
+}
+function normalizeHex(input) {
+    if (/^#[0-9a-fA-F]{6}$/.test(input))
+        return input;
+    if (/^#[0-9a-fA-F]{3}$/.test(input)) {
+        const [, r, g, b] = input.match(/#(.)(.)(.)/) ?? [];
+        return `#${r}${r}${g}${g}${b}${b}`;
+    }
+    return "#d4a24c";
+}
+/* ---------------------------------------------------------------------- */
+/* API connection                                                         */
+/* ---------------------------------------------------------------------- */
+function ApiInfo() {
+    return (_jsxs(Section, { title: "API connection", children: [_jsx(FieldRow, { label: "Base URL", children: _jsx(Code, { children: apiHealth.base }) }), _jsx(FieldRow, { label: "X-Tenant-Slug", children: _jsx(Code, { children: apiHealth.tenantSlug }) }), _jsx("p", { className: "text-[11px] text-ink-500", children: "Every API call from the designer carries this header so the server scopes its data to this workspace. Switching workspaces in the header dropdown updates it instantly." })] }));
+}
+/* ---------------------------------------------------------------------- */
+/* Other workspaces (switch / create)                                     */
+/* ---------------------------------------------------------------------- */
+function OtherWorkspaces() {
+    const tenants = useDesigner((s) => s.tenants);
+    const activeSlug = useDesigner((s) => s.activeTenantSlug);
+    const selectTenant = useDesigner((s) => s.selectTenant);
+    const others = tenants.filter((t) => t.slug !== activeSlug);
+    return (_jsxs(Section, { title: "Other workspaces", subtitle: `${others.length} accessible`, children: [others.length === 0 ? (_jsx("p", { className: "text-[11px] text-ink-500", children: "You only have one workspace. Create another below." })) : (_jsx("ul", { className: "divide-y divide-ink-800 rounded border border-ink-800", children: others.map((t) => (_jsx(OtherTenantRow, { tenant: t, onSwitch: () => selectTenant(t.slug) }, t.id))) })), _jsx(CreateWorkspaceForm, {})] }));
+}
+function OtherTenantRow({ tenant, onSwitch }) {
+    return (_jsxs("li", { className: "flex items-center gap-3 px-3 py-2", children: [_jsxs("div", { className: "min-w-0 flex-1", children: [_jsx("p", { className: "truncate text-xs font-medium text-ink-100", children: tenant.name }), _jsx("p", { className: "truncate font-mono text-[10px] text-ink-500", children: tenant.slug })] }), _jsx("span", { className: [
+                    "rounded-full border px-1.5 py-0.5 text-[9px] uppercase tracking-wider",
+                    tenant.status === "active"
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                        : "border-ink-700 bg-ink-800 text-ink-400",
+                ].join(" "), children: tenant.status }), _jsx("button", { type: "button", onClick: onSwitch, className: "rounded border border-ink-700 bg-ink-800 px-2 py-1 text-[11px] text-ink-100 hover:bg-ink-700", children: "Switch into" })] }));
+}
+function CreateWorkspaceForm() {
+    const createTenant = useDesigner((s) => s.createTenant);
+    const [open, setOpen] = useState(false);
+    const [name, setName] = useState("");
+    const [slug, setSlug] = useState("");
+    const [busy, setBusy] = useState(false);
+    function autoSlug(s) {
+        return s
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "-")
+            .replace(/^-+|-+$/g, "");
+    }
+    async function submit(e) {
+        e.preventDefault();
+        if (!name.trim())
+            return;
+        setBusy(true);
+        try {
+            await createTenant({
+                name: name.trim(),
+                slug: (slug.trim() || autoSlug(name)) || "workspace",
+            });
+            setName("");
+            setSlug("");
+            setOpen(false);
+        }
+        finally {
+            setBusy(false);
+        }
+    }
+    if (!open) {
+        return (_jsx("button", { type: "button", onClick: () => setOpen(true), className: "mt-2 inline-flex items-center gap-1.5 rounded border border-ink-700 bg-ink-800 px-2.5 py-1.5 text-[11px] text-ink-100 hover:bg-ink-700", children: "+ Create workspace" }));
+    }
+    return (_jsxs("form", { onSubmit: submit, className: "mt-2 grid grid-cols-[1fr_1fr_auto_auto] items-end gap-2 rounded border-2 border-dashed border-accent-500/40 bg-accent-500/5 p-3", children: [_jsxs("label", { className: "block", children: [_jsx("span", { className: "block text-[10px] uppercase tracking-wider text-ink-400", children: "Name" }), _jsx("input", { type: "text", value: name, onChange: (e) => {
+                            setName(e.target.value);
+                            if (!slug)
+                                setSlug(autoSlug(e.target.value));
+                        }, autoFocus: true, placeholder: "Mythweaver Studio", className: "mt-0.5 block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 text-xs text-ink-100" })] }), _jsxs("label", { className: "block", children: [_jsx("span", { className: "block text-[10px] uppercase tracking-wider text-ink-400", children: "Slug" }), _jsx("input", { type: "text", value: slug, onChange: (e) => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]+/g, "-")), placeholder: "mythweaver", className: "mt-0.5 block w-full rounded border border-ink-700 bg-ink-900 px-2 py-1 font-mono text-[10px] text-ink-100" })] }), _jsx("button", { type: "button", onClick: () => setOpen(false), className: "rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-[11px] text-ink-300 hover:bg-ink-800", children: "Cancel" }), _jsx("button", { type: "submit", disabled: busy || !name.trim(), className: "rounded border border-accent-500/40 bg-accent-500/15 px-3 py-1.5 text-[11px] font-medium text-accent-300 hover:border-accent-500/70 hover:bg-accent-500/25 disabled:cursor-not-allowed disabled:opacity-40", children: busy ? "…" : "Create" })] }));
+}
+/* ---------------------------------------------------------------------- */
+/* Danger zone                                                            */
+/* ---------------------------------------------------------------------- */
+function DangerZone() {
+    const tenants = useDesigner((s) => s.tenants);
+    const activeSlug = useDesigner((s) => s.activeTenantSlug);
+    const tenant = tenants.find((t) => t.slug === activeSlug) ?? null;
+    const deleteTenant = useDesigner((s) => s.deleteTenant);
+    const onlyOne = tenants.length <= 1;
+    if (!tenant)
+        return null;
+    return (_jsxs("section", { className: "space-y-3 rounded-lg border border-danger-500/30 bg-danger-500/5 p-4", children: [_jsx("h2", { className: "text-[11px] uppercase tracking-wider text-danger-500", children: "Danger zone" }), _jsxs("p", { className: "text-[11px] text-ink-300", children: ["Deleting ", _jsx("code", { className: "font-mono", children: tenant.slug }), " permanently removes every project, card type, card, asset, and member."] }), _jsx("button", { type: "button", disabled: onlyOne, onClick: () => {
+                    if (confirm(`Delete workspace "${tenant.name}"?\nThis removes ALL projects, card types, cards, assets, and members. Cannot be undone.`)) {
+                        void deleteTenant(tenant.id);
+                    }
+                }, title: onlyOne ? "Cannot delete the only workspace" : "Delete this workspace", className: "rounded border border-danger-500/50 bg-danger-500/10 px-3 py-1.5 text-xs font-medium text-danger-500 hover:border-danger-500/80 hover:bg-danger-500/20 disabled:cursor-not-allowed disabled:opacity-40", children: "Delete this workspace" })] }));
+}
+/* ---------------------------------------------------------------------- */
+/* Primitives                                                             */
+/* ---------------------------------------------------------------------- */
+function Section({ title, subtitle, children, }) {
+    return (_jsxs("section", { className: "space-y-3 rounded-lg border border-ink-700 bg-ink-900/60 p-4", children: [_jsxs("div", { className: "flex items-baseline justify-between border-b border-ink-800 pb-2", children: [_jsx("h2", { className: "text-[11px] uppercase tracking-wider text-ink-400", children: title }), subtitle && _jsx("span", { className: "text-[10px] text-ink-500", children: subtitle })] }), _jsx("div", { className: "space-y-3", children: children })] }));
+}
+function FieldRow({ label, hint, children, }) {
+    return (_jsxs("label", { className: "grid grid-cols-[160px_1fr] items-start gap-3", children: [_jsxs("div", { children: [_jsx("div", { className: "text-[11px] font-medium text-ink-200", children: label }), hint && _jsx("div", { className: "text-[10px] text-ink-500", children: hint })] }), _jsx("div", { children: children })] }));
+}
+function Code({ children }) {
+    return (_jsx("span", { className: "rounded bg-ink-900 px-1.5 py-0.5 font-mono text-[11px] text-ink-200", children: children }));
+}

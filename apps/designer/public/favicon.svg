@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img" aria-label="TCGStudio">
+  <defs>
+    <linearGradient id="fPlate" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#071328"/>
+      <stop offset="0.44" stop-color="#092e64"/>
+      <stop offset="1" stop-color="#020713"/>
+    </linearGradient>
+    <linearGradient id="fSilver" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.55" stop-color="#6f819a"/>
+      <stop offset="1" stop-color="#f7fbff"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="188" height="188" rx="36" fill="url(#fPlate)" stroke="#001024" stroke-width="6"/>
+  <circle cx="100" cy="100" r="60" fill="none" stroke="#00d9ff" stroke-width="4"/>
+  <path d="M100 32 L116 90 L180 100 L116 110 L100 168 L84 110 L20 100 L84 90 Z"
+        fill="url(#fSilver)" stroke="#001329" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M100 32 L103 95 L180 100 L103 105 L100 168 L97 105 L20 100 L97 95 Z"
+        fill="#00ebff" opacity="0.9"/>
+</svg>

@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Example TCGStudio Plugin</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #0a0a0c;
+        color: #e2e8f0;
+        font-size: 12px;
+        height: 100%;
+      }
+      main {
+        padding: 12px;
+      }
+      h1 {
+        font-size: 13px;
+        margin: 0 0 8px;
+        font-weight: 600;
+        color: #f8fafc;
+      }
+      dl {
+        display: grid;
+        grid-template-columns: 110px 1fr;
+        gap: 4px 12px;
+        margin: 0 0 12px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+      }
+      dt {
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      dd {
+        margin: 0;
+        color: #f1f5f9;
+        word-break: break-all;
+      }
+      button {
+        font: inherit;
+        font-size: 11px;
+        padding: 4px 10px;
+        margin-right: 6px;
+        background: rgba(148, 86, 245, 0.15);
+        color: #d8b4fe;
+        border: 1px solid rgba(148, 86, 245, 0.4);
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: rgba(148, 86, 245, 0.25);
+      }
+      pre {
+        background: #111114;
+        border: 1px solid #1f2025;
+        border-radius: 4px;
+        padding: 6px 8px;
+        font-size: 11px;
+        max-height: 220px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      footer {
+        color: #64748b;
+        font-size: 10px;
+        margin-top: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Example plugin</h1>
+      <dl>
+        <dt>Tenant</dt>
+        <dd id="tenant">…</dd>
+        <dt>Project</dt>
+        <dd id="project">…</dd>
+        <dt>Locale</dt>
+        <dd id="locale">…</dd>
+        <dt>Permissions</dt>
+        <dd id="perms">…</dd>
+      </dl>
+      <div>
+        <button id="ping">Toast hi!</button>
+        <button id="cards">List cards</button>
+        <button id="assets">List assets</button>
+        <button id="forbid">Try a forbidden call</button>
+      </div>
+      <pre id="out">// output appears here</pre>
+      <footer>
+        Sandboxed iframe · talks to host via postMessage RPC ·
+        permissions enforced server-side and at the bridge.
+      </footer>
+    </main>
+
+    <script type="module">
+      // Inline the SDK so the example works standalone without a
+      // build step. Real plugins import from the published path
+      // (`/sdk/plugin-sdk.js` or whatever the platform CDN publishes).
+      import { plugin } from "/sdk/plugin-sdk.js";
+
+      const out = document.getElementById("out");
+      const log = (label, value) => {
+        out.textContent =
+          `// ${label}\n` +
+          (typeof value === "string" ? value : JSON.stringify(value, null, 2));
+      };
+
+      const init = await plugin.ready();
+      const ctx = init.hostContext;
+      document.getElementById("tenant").textContent = ctx.tenantSlug || "(none)";
+      document.getElementById("project").textContent = ctx.projectSlug ?? "(none)";
+      document.getElementById("locale").textContent = ctx.locale;
+      document.getElementById("perms").textContent =
+        ctx.grantedPermissions.join(", ") || "(none)";
+
+      document.getElementById("ping").onclick = () => {
+        plugin.toast("Hello from the example plugin!");
+        log("toast", "fired");
+      };
+
+      document.getElementById("cards").onclick = async () => {
+        try {
+          const cards = await plugin.call("cards.list", {
+            projectId: ctx.projectId ?? undefined,
+          });
+          log("cards.list", cards);
+        } catch (err) {
+          log("cards.list error", `${err.code ?? "error"}: ${err.message}`);
+        }
+      };
+
+      document.getElementById("assets").onclick = async () => {
+        try {
+          const assets = await plugin.call("assets.list", {
+            projectId: ctx.projectId ?? undefined,
+          });
+          log("assets.list", assets);
+        } catch (err) {
+          log("assets.list error", `${err.code ?? "error"}: ${err.message}`);
+        }
+      };
+
+      document.getElementById("forbid").onclick = async () => {
+        try {
+          // Intentionally calls a method this manifest didn't request.
+          // The host returns permission_denied without invoking the
+          // handler.
+          const r = await plugin.call("exports.create", {});
+          log("exports.create", r);
+        } catch (err) {
+          log("exports.create blocked", `${err.code ?? "error"}: ${err.message}`);
+        }
+      };
+    </script>
+  </body>
+</html>

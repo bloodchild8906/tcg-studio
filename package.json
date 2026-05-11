@@ -1,0 +1,29 @@
+{
+  "name": "tcgstudio",
+  "private": true,
+  "version": "0.0.0",
+  "description": "TCGStudio — multi-tenant white-label TCG creation and publishing platform.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "designer:dev": "npm --workspace apps/designer run dev",
+    "designer:build": "npm --workspace apps/designer run build",
+    "designer:typecheck": "npm --workspace apps/designer run typecheck",
+    "api:dev": "npm --workspace apps/api run dev",
+    "api:build": "npm --workspace apps/api run build",
+    "api:typecheck": "npm --workspace apps/api run typecheck",
+    "api:migrate": "docker compose exec api npm run prisma:migrate",
+    "api:seed": "docker compose exec api npm run seed",
+    "up": "docker compose up --build",
+    "down": "docker compose down",
+    "clean": "docker compose down -v"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "jspdf": "^2.5.2"
+  }
+}

@@ -1,0 +1,121 @@
+name: Deploy to GCE VM
+
+# Triggered on push to main. Manual dispatch is also available for retries
+# without having to push an empty commit.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Single in-flight deploy at a time — back-to-back pushes serialize.
+# `cancel-in-progress: false` because docker compose builds aren't
+# safe to cancel mid-write (leaves the api container in a bad state).
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: rsync + docker compose up
+    runs-on: ubuntu-latest
+
+    # All deploy logic in one job so we can fail fast and have a single
+    # log stream to read. The job runs in ~3-5 min when the cache is warm.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        # The deploy key is stored as a GitHub secret (SSH_PRIVATE_KEY).
+        # We write it to a file, chmod 600, and configure ssh to use it
+        # without an interactive known_hosts prompt — `StrictHostKeyChecking`
+        # is set to `accept-new` so first-time fingerprints are auto-accepted
+        # but a subsequent change (potential MITM) still fails the job.
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_ed25519
+          chmod 600 ~/.ssh/deploy_ed25519
+          cat >> ~/.ssh/config <<EOF
+          Host gce
+            HostName ${{ secrets.VM_HOST }}
+            User ${{ secrets.VM_USER }}
+            IdentityFile ~/.ssh/deploy_ed25519
+            StrictHostKeyChecking accept-new
+            UserKnownHostsFile ~/.ssh/known_hosts
+          EOF
+
+      - name: Rsync sources to VM
+        # Push everything except node_modules / .git / build artifacts.
+        # The VM rebuilds inside docker, so we never want to copy host
+        # node_modules — they'd shadow the container's prisma binary
+        # and break startup.
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='dist' \
+            --exclude='*.tsbuildinfo' \
+            --exclude='_legacy' \
+            --exclude='deploy/.env*' \
+            --exclude='deploy/.secrets.local' \
+            --exclude='*.log' \
+            ./ gce:/home/${{ secrets.VM_USER }}/tcgstudio/
+
+      - name: Run prisma migrate deploy
+        # If the API container is up the prisma binary is already inside
+        # it; just exec. If the API isn't up (first-ever deploy) the next
+        # step's `up -d` will bring it up and we can run migrate after.
+        run: |
+          ssh gce '
+            set -e
+            cd ~/tcgstudio
+            if sudo docker compose -f deploy/docker-compose.prod.yml ps api --status running 2>/dev/null | grep -q api; then
+              sudo docker compose -f deploy/docker-compose.prod.yml exec -T api npx prisma migrate deploy
+            else
+              echo "api not running yet — migrations will run after first up"
+            fi
+          '
+
+      - name: Build and start services
+        # docker compose build picks up only the layers that changed
+        # thanks to the buildkit cache on disk. --remove-orphans cleans
+        # any services that were removed from compose.
+        run: |
+          ssh gce '
+            set -e
+            cd ~/tcgstudio
+            sudo docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env build
+            sudo docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env up -d --remove-orphans
+            # First-deploy fallback: if migrate hasnt run because the api
+            # wasnt up earlier, run it now.
+            sudo docker compose -f deploy/docker-compose.prod.yml exec -T api npx prisma migrate deploy
+            sudo docker compose -f deploy/docker-compose.prod.yml ps
+          '
+
+      - name: Purge Cloudflare cache
+        # Bust the CDN so visitors see the new bundle immediately. The
+        # SPA bundle filename is hashed so this isnt strictly required,
+        # but the *.html index references the hash by name and CF caches
+        # the index too. Skipped if the secrets arent set.
+        if: ${{ secrets.CLOUDFLARE_ZONE_ID != '' && secrets.CLOUDFLARE_TOKEN != '' }}
+        run: |
+          curl -fsS -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data '{"purge_everything":true}'
+
+      - name: Smoke test
+        # Hit the API healthz through the public URL — fails the job if
+        # the new deploy is unreachable so we get a clear red signal in
+        # the GitHub Actions UI.
+        run: |
+          for i in 1 2 3 4 5; do
+            if curl -fsS "https://${{ secrets.PUBLIC_HOST || 'tcgstudio.online' }}/healthz" >/dev/null; then
+              echo "deploy healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "smoke test failed"
+          exit 1

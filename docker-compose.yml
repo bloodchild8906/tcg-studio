@@ -1,0 +1,139 @@
+# TCGStudio local development stack.
+#
+# Services:
+#   designer  — Vite dev server for the Card Type Designer (apps/designer)
+#   postgres  — primary tenant data store (Prisma schema lands here later)
+#   redis     — cache / pub-sub for jobs and websocket fan-out
+#   minio     — S3-compatible object storage for tenant assets and exports
+#
+# Bring up everything:           docker compose up --build
+# Bring up just the designer:    docker compose up --build designer
+# Wipe data volumes:             docker compose down -v
+#
+# Defaults can be overridden via .env (see .env.example).
+
+name: tcgstudio
+
+services:
+  designer:
+    build:
+      context: .
+      dockerfile: apps/designer/Dockerfile
+      target: dev
+    image: tcgstudio/designer:dev
+    container_name: tcgstudio-designer
+    working_dir: /workspace/apps/designer
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0", "--port", "5173"]
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+      WATCHPACK_POLLING: "true"
+      VITE_API_URL: "http://localhost:4000"
+    ports:
+      - "${DESIGNER_PORT:-5173}:5173"
+    volumes:
+      # Source bind-mount for hot reload. node_modules stays inside the container
+      # so host platform differences (Windows line endings, optional binaries) don't
+      # leak into the Linux runtime.
+      - ./apps/designer:/workspace/apps/designer
+      - ./package.json:/workspace/package.json:ro
+      - ./packages:/workspace/packages
+      - designer_node_modules:/workspace/node_modules
+      - designer_app_node_modules:/workspace/apps/designer/node_modules
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: dev
+    image: tcgstudio/api:dev
+    container_name: tcgstudio-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      HOST: "0.0.0.0"
+      PORT: "4000"
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-tcg}:${POSTGRES_PASSWORD:-tcg}@postgres:5432/${POSTGRES_DB:-tcgstudio}?schema=public"
+      CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173"
+      DEFAULT_TENANT_SLUG: "demo"
+      PRETTY_LOGS: "true"
+      MINIO_ENDPOINT: "minio"
+      MINIO_PORT: "9000"
+      MINIO_USE_SSL: "false"
+      MINIO_ACCESS_KEY: "${MINIO_ROOT_USER:-tcg}"
+      MINIO_SECRET_KEY: "${MINIO_ROOT_PASSWORD:-tcgtcgtcg}"
+      MINIO_BUCKET: "tcgstudio"
+    ports:
+      - "${API_PORT:-4000}:4000"
+    volumes:
+      - ./apps/api:/workspace/apps/api
+      - ./package.json:/workspace/package.json:ro
+      - ./packages:/workspace/packages
+      - api_node_modules:/workspace/node_modules
+      - api_app_node_modules:/workspace/apps/api/node_modules
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tcgstudio-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-tcg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tcg}
+      POSTGRES_DB: ${POSTGRES_DB:-tcgstudio}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tcg} -d ${POSTGRES_DB:-tcgstudio}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: tcgstudio-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: tcgstudio-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-tcg}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-tcgtcgtcg}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  designer_node_modules:
+  designer_app_node_modules:
+  api_node_modules:
+  api_app_node_modules:
+  postgres_data:
+  redis_data:
+  minio_data:

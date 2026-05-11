@@ -1,0 +1,2219 @@
+// TCGStudio — Prisma schema (foundation slice).
+//
+// This is the v0 backbone for sec 44 of the spec. We're modelling the entities
+// the Card Type Designer will read/write first, plus the tenant/user/project
+// chain that scopes everything. We're DELIBERATELY skipping plugin tables, CMS
+// tables, RBAC permission rows, audit logs, marketplace, billing — those land
+// in later migrations. The point of this slice is: prove tenant isolation,
+// prove templates persist, prove a project can hold card types and cards.
+//
+// Conventions:
+//   • IDs are CUIDs ("clp...") — readable, sortable, unique enough.
+//   • Every tenant-owned table has tenantId + an index on it.
+//   • Soft deletes are NOT used in this slice — cleaner for v0. We add deletedAt
+//     later when we wire audit/recovery flows.
+//   • Status fields are strings (not enums) so plugins can extend them without
+//     a migration. Spec sec 18.3 / 27.2 lists possible values.
+//   • Free-form JSON lives in `Json` columns rather than separate tables. The
+//     designer's `CardTypeTemplate` JSON is stored on Template.contentJson,
+//     and per-card field data lives on Card.dataJson. Schemas (sec 22) are
+//     stored on CardType.schemaJson.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// A tenant — the top-level customer workspace (sec 9.3).
+/// Every operational entity below points back to this row.
+model Tenant {
+  id        String   @id @default(cuid())
+  /// Display name shown in branding fallbacks.
+  name      String
+  /// URL-safe identifier; used for path-prefix tenant resolution (sec 10.4).
+  slug      String   @unique
+  /// trial | active | past_due | suspended | disabled | pending_deletion (sec 10.8)
+  status    String   @default("active")
+  /// White-label branding (sec 11). Free-form JSON so the client can extend
+  /// without a migration; common keys: productName, accentColor (hex),
+  /// logoAssetId, hidePlatformBranding (boolean), supportEmail, legalName.
+  brandingJson Json @default("{}")
+  /// Inline white-label images — stored directly in postgres so the
+  /// branding pipeline doesn't fan out to the asset library + object
+  /// storage for what is almost always a one-time upload per tenant.
+  /// Small (< 512 KB each), served from
+  ///   GET /api/v1/public/{slug}/branding/{logo|icon|favicon}
+  /// so unauthenticated visitors can fetch them for the public site
+  /// header. When set, these take priority over `brandingJson.logoAssetId`
+  /// because they're faster (no asset-row lookup, no object-storage hop).
+  logoImage        Bytes?
+  logoMimeType     String?
+  iconImage        Bytes?
+  iconMimeType     String?
+  faviconImage     Bytes?
+  faviconMimeType  String?
+  /// Tenant archetype (sec 8). Drives the dashboard preset, default
+  /// nav grouping, and the suggested next-step prompts. Stored as a
+  /// string so we can add new types without migrations:
+  ///   solo       — Solo Creator
+  ///   studio     — Indie Studio (default)
+  ///   publisher  — Publisher / multi-game roll-up
+  ///   school     — School or University
+  ///   reseller   — Reseller / white-label hosting
+  tenantType String @default("studio")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships   Membership[]
+  projects      Project[]
+  cardTypes     CardType[]
+  templates     Template[]
+  cards         Card[]
+  assets        Asset[]
+  sets          Set[]
+  keywords      Keyword[]
+  factions      Faction[]
+  blocks        Block[]
+  lore          Lore[]
+  decks         Deck[]
+  boards        BoardLayout[]
+  rulesets      Ruleset[]
+  abilities     Ability[]
+  variantBadges VariantBadge[]
+  domains       TenantDomain[]
+  cmsSites      CmsSite[]
+  assetFolders  AssetFolder[]
+  apiKeys       ApiKey[]
+  auditLogs     AuditLog[]
+  webhooks      Webhook[]
+  jobs          Job[]
+  marketplaceListings  MarketplacePackage[]
+  marketplaceInstalls  MarketplaceInstall[]
+  marketplaceReviews   MarketplaceReview[]
+  marketplacePublisher MarketplacePublisher?
+  roles                Role[]
+  supportTickets       SupportTicket[]
+
+  /// Billing — references the Plan this tenant is subscribed to.
+  /// Defaults to the platform's free tier on tenant creation.
+  /// `null` means "no plan attached yet" — the limit checker treats
+  /// these like the free tier in dev, blocks them in production.
+  planId   String?
+  plan     Plan?     @relation(fields: [planId], references: [id], onDelete: SetNull)
+  /// When the current plan period started — used by the usage counters
+  /// to roll over monthly limits (exports/month, API calls, etc).
+  /// Reset by the billing cron when a new period begins.
+  planSince DateTime @default(now())
+
+  /// Localization (sec 47). IETF BCP 47 tag — `en`, `en-US`, `de`,
+  /// `pt-BR`. The default locale is the fallback when content lacks a
+  /// translation for the requested language. Defaults to `en` on
+  /// creation; tenants change it from Settings → Localization.
+  defaultLocale       String @default("en")
+  /// Array of locale tags this tenant has enabled. Always includes
+  /// `defaultLocale` (enforced at update time). The public site's
+  /// language switcher only shows these.
+  supportedLocalesJson Json   @default("[\"en\"]")
+
+  /// Database isolation tier (sec 10.3). v0 platform runs everyone on
+  /// `shared`; an enterprise tenant can move to `dedicated` and the
+  /// prisma routing layer will swap connection strings on tenant
+  /// resolution. The full prisma-per-tenant plumbing lands as a
+  /// separate work item; this field captures the policy decision now
+  /// so the rest of the code can branch on it.
+  ///   shared    — single platform DB, tenantId-scoped rows (current).
+  ///   schema    — single DB, dedicated PostgreSQL schema per tenant.
+  ///   dedicated — completely separate DB instance.
+  databaseTier String @default("shared")
+  /// Connection string for the tenant's dedicated DB. Null when
+  /// `databaseTier == "shared"`; populated by the provisioning job
+  /// when the tenant moves to a dedicated tier. Encrypted at rest in
+  /// production deployments — see /lib/secrets.
+  databaseUrl  String?
+
+  /// Email provider config (sec 51 — tenant-configurable SMTP).
+  /// Free-form JSON so we can grow per-provider fields without
+  /// schema migrations. Common shape:
+  ///   { provider: "smtp"|"sendgrid"|"ses"|"postmark"|"resend",
+  ///     host, port, username, password (encrypted),
+  ///     fromAddress, fromName, replyTo,
+  ///     apiKey (for hosted providers) }
+  /// Falls back to the platform default sender when null/empty.
+  emailSettingsJson   Json @default("{}")
+  /// Storage provider config (sec 43). Same free-form shape:
+  ///   { provider: "local"|"s3"|"r2"|"minio"|"gcs"|"azure",
+  ///     bucket, region, endpoint,
+  ///     accessKeyId, secretAccessKey (encrypted),
+  ///     publicUrlPrefix, forcePathStyle }
+  /// Falls back to the platform default (MinIO in dev, R2 in prod).
+  storageSettingsJson Json @default("{}")
+
+  invitations          Invitation[]
+}
+
+/// A custom domain that a tenant has attached to their workspace
+/// (sec 11.5). One tenant can register many — e.g. an apex domain plus
+/// a "studio." subdomain plus a campaign-specific marketing domain.
+///
+/// Resolution flow when an HTTP request comes in:
+///   1. Try the configured root domain pattern (`<sub>.tcgstudio.local`).
+///   2. If that misses, fall back to a TenantDomain lookup by hostname.
+///   3. If THAT misses, the request is platform-level / unauth'd public.
+///
+/// Verification: when a tenant adds a domain we generate a token and
+/// expect them to add a `_tcgstudio-verify.<host>` TXT record. Until
+/// the verification is confirmed, the domain stays in `pending` and
+/// we don't accept traffic for it (avoids a malicious tenant claiming
+/// someone else's domain by sheer luck).
+model TenantDomain {
+  id              String   @id @default(cuid())
+  tenantId        String
+  /// Lowercase hostname, no scheme, no path. Globally unique — a
+  /// hostname can map to at most one tenant.
+  hostname        String   @unique
+  /// Random verification token the tenant publishes via TXT record.
+  verificationToken String
+  /// pending | verified | active | failed | disabled
+  status          String   @default("pending")
+  /// One domain per tenant gets the "primary" flag — drives
+  /// canonical-URL choices in emails / notifications / public links.
+  isPrimary       Boolean  @default(false)
+  /// Optional projectSlug. When set, this domain resolves DIRECTLY to
+  /// a project (e.g. `cards.acmegames.com` → tenant=acme project=core).
+  /// Without it, the domain resolves to the tenant root and project
+  /// scoping happens via subdomains under the custom domain.
+  projectSlug     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  verifiedAt      DateTime?
+  /// Last time we ran a DNS check against this hostname.
+  lastCheckedAt   DateTime?
+  /// Short machine-readable reason for the current status. One of:
+  ///   ok | txt_missing | txt_mismatch | cname_missing | cname_wrong_target |
+  ///   dns_lookup_failed | manual_disabled
+  /// `ok` means both TXT and CNAME are good and the domain is active.
+  statusReason    String?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+/// A platform-level user identity. A user can belong to multiple tenants
+/// (sec 12.3), so we keep this independent of Tenant and link via Membership.
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  /// bcrypt hash. Nullable so seed users / legacy rows don't block; real
+  /// signups always set this.
+  passwordHash String?
+  /// Public-facing display name (defaults to `name`).
+  displayName  String?
+  /// Markdown-rendered bio for the profile page.
+  bio          String   @default("")
+  /// Asset id for the user's avatar (lives on the user's primary tenant
+  /// for storage purposes). Used when the avatar was uploaded as a full
+  /// CMS asset — typically a higher-resolution image the user also
+  /// references elsewhere.
+  avatarAssetId String?
+  /// Inline avatar image — stored directly in postgres so profile photos
+  /// don't depend on MinIO / GCS availability. Small (under ~256 KB) and
+  /// served from the API at `GET /api/v1/users/{id}/avatar`. The mime type
+  /// is needed because we don't want to guess the content-type of an
+  /// arbitrary byte blob. When both `avatarImage` and `avatarAssetId` are
+  /// set, the inline one wins because it's faster (no extra round trip).
+  avatarImage     Bytes?
+  avatarMimeType  String?
+  /// IANA timezone ("America/Los_Angeles") — used for relative time
+  /// formatting in tasks / messages / planning views.
+  timezone      String  @default("UTC")
+  /// Free-form preferences (theme, density, locale).
+  preferencesJson Json  @default("{}")
+  /// Platform-level role (sec 13.2). Null for ordinary users —
+  /// they can only ever see tenants they're a member of. Set to
+  /// `owner`, `admin`, or `support` to expose the platform-admin
+  /// surface (cross-tenant tenants directory, billing roll-up,
+  /// announcements, etc.) at the platform root.
+  platformRole String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships   Membership[]
+  projectMemberships ProjectMembership[]
+  notifications Notification[]
+  tasks         TenantTask[] @relation("TaskAssignee")
+  authoredMessages Message[]
+}
+
+/// Joins a user to a tenant with a role (sec 13.3 — "Tenant Owner",
+/// "Project Creator", etc). Roles are strings here, not a separate table,
+/// because RBAC details live in a future migration.
+model Membership {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  /// tenant_owner | tenant_admin | project_creator | viewer (sec 13.3)
+  role      String   @default("viewer")
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId])
+  @@index([tenantId])
+  @@index([userId])
+}
+
+/// One card game / product line (sec 16). The container for templates, cards,
+/// assets, sets — pretty much everything the designer touches.
+/// Joins a user to a single project with a project-scoped role
+/// (sec 13.4). Layered ON TOP of tenant Membership: a user must be a
+/// tenant member AND have a ProjectMembership row to access project-
+/// scoped data. There is NO tenant-role bypass — even a tenant_owner
+/// can't log in to a project they don't have a row in. This enforces
+/// the platform policy that tenant management and project login are
+/// independent identities; a tenant admin who creates a project must
+/// nominate the owner email at create time, and that email is the
+/// only login until the owner adds more.
+///
+/// Roles here mirror sec 13.4: project_owner, project_admin,
+/// game_designer, card_designer, template_designer, rules_designer,
+/// ability_designer, artist, writer, set_manager, export_manager,
+/// playtester, viewer.
+model ProjectMembership {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  role      String   @default("viewer")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([projectId])
+  @@index([userId])
+}
+
+model Project {
+  id          String   @id @default(cuid())
+  tenantId    String
+  /// Display name ("Saga: Tales Unchained", "Internal Prototype 2026").
+  name        String
+  /// URL-safe slug, unique inside the tenant (not globally).
+  slug        String
+  description String   @default("")
+  /// idea | draft | prototype | playtesting | production | released | archived (sec 16.3)
+  status      String   @default("draft")
+  /// Designer-visible version stamp ("v0.1", "alpha"). Free-form by intent.
+  version     String   @default("v0.1")
+  /// Project-level locale override. When set, overrides the tenant's
+  /// defaultLocale for THIS project's content (cards, lore, sets,
+  /// CMS pages scoped to the project). Tenants whose projects all
+  /// share one language can leave this null and inherit from tenant.
+  defaultLocale       String?
+  /// Subset of the tenant's supported locales that THIS project
+  /// publishes translations for. Null = inherit tenant.
+  supportedLocalesJson Json?
+  /// Project-level theme tokens — colors, accent, layout overrides
+  /// scoped to THIS project. Mirrors `Tenant.brandingJson` in shape.
+  /// Lets a project skin its own admin / public surface without
+  /// touching the tenant theme. Null = inherit tenant.
+  brandingJson Json?
+  /// Economy config — pricing, currency, royalty splits, payout
+  /// account. Free-form JSON so the schema can grow without
+  /// migrations. Common keys:
+  ///   { currency: "USD",
+  ///     priceTiers: [{ id, name, priceCents }],
+  ///     royaltySplits: [{ payeeUserId, percent }],
+  ///     payoutAccountId,           // ref to a payment-processor account
+  ///     defaultProductPriceCents,
+  ///     taxRegion }
+  /// Empty = the project doesn't sell anything (default state).
+  economyJson  Json @default("{}")
+  /// Marketing config — SEO defaults, social handles, newsletter
+  /// integration, UTM templates, OG image. Used by the public site
+  /// renderer. Common keys:
+  ///   { seoTitle, seoDescription,
+  ///     ogImageAssetId, twitterHandle, discordUrl, youtubeUrl,
+  ///     newsletterProvider, newsletterListId,
+  ///     campaignUtmTemplate, gaMeasurementId }
+  marketingJson Json @default("{}")
+  /// Storefront config — toggles + commerce policies for the public
+  /// store at /shop on the project's public site. Common keys:
+  ///   { enabled: false,
+  ///     storefrontUrl,             // optional external storefront
+  ///     supportsDigital, supportsPhysical, supportsSubscription,
+  ///     fulfillmentMode: "print-on-demand"|"manual"|"none",
+  ///     refundPolicyMd, termsUrl, shippingPolicyMd,
+  ///     featuredProductIds: [] }
+  /// Empty = no storefront published.
+  storefrontJson Json @default("{}")
+  /// Per-project email provider config. Lets a project use its own
+  /// outgoing-mail credentials (e.g. for a project-branded
+  /// newsletter signup confirmation) separately from the tenant's
+  /// general email setup. Empty = inherit tenant.
+  emailSettingsJson   Json @default("{}")
+  /// Per-project storage backend. Tenants don't need their own
+  /// storage tier — the platform handles that — but each project
+  /// can route its asset uploads to a dedicated bucket for residency
+  /// or cost reasons. Empty = use tenant default (which itself
+  /// defaults to platform storage).
+  storageSettingsJson Json @default("{}")
+  /// Database isolation tier (sec 10.3). v0 projects always inherit
+  /// the tenant's DB; an enterprise project can break out to its own
+  /// schema or DB instance. Same vocabulary as Tenant.databaseTier.
+  ///   inherit   — use the tenant's DB (default).
+  ///   schema    — dedicated PG schema in the tenant's DB.
+  ///   dedicated — completely separate DB.
+  databaseTier String @default("inherit")
+  /// Connection string for the project's dedicated DB. Null unless
+  /// `databaseTier != "inherit"`. Populated by the provisioning job.
+  databaseUrl  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  memberships ProjectMembership[]
+  cardTypes CardType[]
+  templates Template[]
+  cards     Card[]
+  assets    Asset[]
+  sets      Set[]
+  keywords  Keyword[]
+  factions  Faction[]
+  blocks    Block[]
+  lore      Lore[]
+  decks     Deck[]
+  boards    BoardLayout[]
+  rulesets  Ruleset[]
+  abilities Ability[]
+  variantBadges VariantBadge[]
+  cmsSites  CmsSite[]
+  assetFolders AssetFolder[]
+  apiKeys   ApiKey[]
+  supportTickets SupportTicket[]
+  invitations Invitation[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+}
+
+/// A variant badge (sec 21.x) — visual marker stamped on cards to
+/// indicate a printing variant: foil, promo, showcase, alt-art,
+/// language, championship, etc.
+///
+/// Cards reference badges via `dataJson.variantBadges` (array of
+/// badge ids). Badges can also auto-apply via a JSON condition that
+/// evaluates against the card's `dataJson` — e.g. a "Foil" badge
+/// configured with `{"foil": true}` automatically appears on any card
+/// whose dataJson has `foil = true`.
+///
+/// Visual properties (icon asset, color, shape, position) drive the
+/// renderer's output without per-card layout authoring. A dedicated
+/// "variant_badge" layer type on the card template is responsible for
+/// rendering badges; layouts that don't include this layer type
+/// simply don't show badges (cards still carry the data).
+model VariantBadge {
+  id          String  @id @default(cuid())
+  tenantId    String
+  projectId   String
+  name        String
+  slug        String
+  /// Short label rendered on the badge itself (e.g. "FOIL", "PROMO").
+  /// Empty when the badge is purely an icon.
+  label       String  @default("")
+  /// Optional icon asset id from the asset library.
+  iconAssetId String?
+  /// Hex color for the badge background (e.g. "#d4a24c" for gold).
+  color       String  @default("#d4a24c")
+  /// Foreground / text color (e.g. "#ffffff").
+  textColor   String  @default("#ffffff")
+  /// Shape of the badge background — circle | rounded | banner | star.
+  shape       String  @default("rounded")
+  /// Default placement on the card — top_left | top_right | bottom_left
+  /// | bottom_right | bottom_center. The renderer respects per-layer
+  /// overrides; this is the fallback.
+  position    String  @default("top_right")
+  /// Optional auto-apply condition. When set, the badge appears on any
+  /// card whose dataJson satisfies the condition. Shape mirrors
+  /// `AppliesWhenRule` from the layer variant system: { match, conditions[] }.
+  /// Empty / null = manual selection only (via dataJson.variantBadges).
+  conditionJson Json @default("{}")
+  /// draft | active | archived
+  status      String  @default("active")
+  sortOrder   Int     @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// An ability (sec 24) — a reusable rules-text fragment with structured
+/// trigger / cost / effect fields, optionally backed by a keyword. Cards
+/// reference abilities from `dataJson.abilities` (array of ids).
+///
+/// Why a structured table rather than free-form rules text on each card:
+///   • abilities recur across cards — "deal 2 damage to target" appears
+///     on dozens of cards. One canonical record means an errata edits
+///     all uses at once.
+///   • the playtest engine can later resolve scripted abilities via the
+///     `graphJson` payload (visual node graph — sec 24.2). Until then
+///     the text fields drive the printed rules block.
+///   • keyword-granted abilities (Swift, Ward N, …) link back to a
+///     Keyword row, keeping the glossary canonical.
+model Ability {
+  id              String  @id @default(cuid())
+  tenantId        String
+  projectId       String
+  name            String
+  slug            String
+  /// static | triggered | activated | replacement | prevention | resource | combat
+  kind            String  @default("static")
+  /// Short rules-text rendered on the card (e.g. "Whenever you draw a card, this gains +1/+1.").
+  text            String  @default("")
+  /// Optional flavor / reminder text rendered in italics under the rules text.
+  reminderText    String  @default("")
+  /// Trigger condition (free-form for now: "enters battlefield", "your upkeep", "tapped", …).
+  trigger         String  @default("")
+  /// Cost to activate (e.g. "{T}", "Pay 2 life", "Discard a card"). Blank for static / triggered.
+  cost            String  @default("")
+  /// Optional link back to a keyword in the glossary.
+  keywordId       String?
+  /// Optional list of related card ids (synergistic cards / errata refs).
+  relatedCardIds  Json    @default("[]")
+  /// Optional ability-graph snapshot (sec 24.2). Empty until the visual
+  /// graph editor ships; the field is reserved here so we don't have to
+  /// migrate the schema again later.
+  graphJson       Json    @default("{}")
+  /// draft | review | approved | deprecated
+  status          String  @default("draft")
+  sortOrder       Int     @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([projectId, kind])
+}
+
+/// A ruleset (sec 23) defines the gameplay loop for a project — phase
+/// order, player count, starting resources, win conditions, and the
+/// catalog of player + card actions the playtest engine can run.
+///
+/// The whole config lives in `configJson` because:
+///   • it's deeply nested (phases → autoActions → params), and SQL would
+///     fragment the data unhelpfully
+///   • authors iterate fast on rules; JSON keeps schema migrations rare
+///   • the playtest engine on the client is the canonical interpreter,
+///     so server-side validation beyond a basic shape check would just
+///     duplicate logic
+///
+/// One project can have multiple rulesets — e.g. "Constructed", "Draft",
+/// "Solo dungeon", "4-player free-for-all" all share the same cards but
+/// different turn structures and win conditions.
+model Ruleset {
+  id           String   @id @default(cuid())
+  tenantId     String
+  projectId    String
+  name         String
+  slug         String
+  description  String   @default("")
+  /// The full ruleset config. Shape lives in
+  /// designer/src/lib/playtestEngine.ts → RulesetConfig.
+  configJson   Json     @default("{}")
+  /// draft | active | archived
+  status       String   @default("draft")
+  /// Display order within the project. Lower = earlier in pickers.
+  sortOrder    Int      @default(0)
+  /// Convenience flag: when true, this is the project's default
+  /// ruleset for new playtest sessions.
+  isDefault    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// A board layout (sec 26) — the play area. Defines named zones (deck,
+/// hand, discard, battlefield, command, …) with their bounds, owner,
+/// visibility, stack mode, and per-zone interaction rules.
+///
+/// Zones live as a JSON array on `zonesJson` rather than a separate
+/// table because:
+///   • zones are always loaded together with the board
+///   • the playtest engine needs the full layout snapshot atomically
+///   • zone schemas evolve fast (new flags per game) and JSON keeps the
+///     migration story simple
+///
+/// `size` defines the design canvas (in px). Per-zone bounds resolve in
+/// this canvas's coordinate space; the playtest renderer scales the
+/// whole board to fit the viewport without distorting zones.
+model BoardLayout {
+  id           String   @id @default(cuid())
+  tenantId     String
+  projectId    String
+  name         String
+  slug         String
+  description  String   @default("")
+  /// Pixel dimensions of the design canvas. Defaults to a 1920x1080
+  /// landscape playmat — most digital playtest UIs target this aspect.
+  width        Int      @default(1920)
+  height       Int      @default(1080)
+  /// Background fill (hex or CSS color string). Rendered behind zones.
+  background   String   @default("#1a1d2a")
+  /// Zone definitions — see designer/src/types.ts BoardZone for shape.
+  zonesJson    Json     @default("[]")
+  /// Free-form metadata — table-talk rules, default starting hand size,
+  /// life total, turn structure overrides, etc.
+  metadataJson Json     @default("{}")
+  /// draft | active | archived
+  status       String   @default("draft")
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// A deck (sec 30) — a curated list of cards. Pre-built starter decks
+/// ship with a set; user decks belong to a player profile (later). For
+/// MVP, decks live at the project level and are authored manually.
+///
+/// Format describes the gameplay mode this deck targets: "constructed",
+/// "draft", "commander", "sealed", "starter", etc. Formats are free-form
+/// strings so each tenant can define their own without schema churn.
+model Deck {
+  id           String   @id @default(cuid())
+  tenantId     String
+  projectId    String
+  name         String
+  slug         String
+  description  String   @default("")
+  /// Gameplay mode this deck targets. Free-form so each game can define
+  /// its own conventions (constructed / commander / draft / sealed / …).
+  format       String   @default("constructed")
+  /// Optional dominant faction for filtering / grouping.
+  factionId    String?
+  /// Optional canonical set this deck is from (e.g. starter deck for set X).
+  setId        String?
+  /// Optional cover image asset id.
+  coverAssetId String?
+  /// draft | testing | locked | published | archived
+  status       String   @default("draft")
+  /// private | tenant_internal | project_internal | public
+  visibility   String   @default("private")
+  /// Free-form notes / metadata (color identity, win condition tags, etc.).
+  metadataJson Json     @default("{}")
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant  Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  cards   DeckCard[]
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// One card slot in a deck — composite entry with quantity + optional
+/// sideboard flag. Cards are referenced by id, not by slug, so a card
+/// rename doesn't break the deck. The card itself can be deleted; we
+/// `onDelete: Cascade` from card → deckCard so the slot disappears
+/// rather than dangling.
+model DeckCard {
+  id         String  @id @default(cuid())
+  deckId     String
+  cardId     String
+  quantity   Int     @default(1)
+  /// True when the entry is in the sideboard rather than the main deck.
+  sideboard  Boolean @default(false)
+  /// Optional category label ("creatures", "lands", "removal" etc).
+  category   String  @default("")
+
+  deck Deck @relation(fields: [deckId], references: [id], onDelete: Cascade)
+  card Card @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@unique([deckId, cardId, sideboard])
+  @@index([deckId])
+  @@index([cardId])
+}
+
+/// Lore (sec 29) — worldbuilding records that connect cards, factions,
+/// sets, characters, and the public CMS. One model handles many "kinds"
+/// (world / region / character / artifact / event / timeline / chapter)
+/// because the editor and API surface are uniform; only the rendered
+/// public-site template differs per kind.
+///
+/// `relations` is a free-form list of references to other entities —
+/// `{ kind: "card" | "faction" | "set" | "lore", id, slug }`. The CMS
+/// uses this to render "appears in" / "related" sidebars on public
+/// pages. We store as JSON so authors can extend without schema churn.
+model Lore {
+  id           String   @id @default(cuid())
+  tenantId     String
+  projectId    String
+  /// world | region | character | artifact | event | timeline | chapter | custom
+  kind         String   @default("character")
+  name         String
+  slug         String
+  /// Short summary shown on listing pages and tile previews.
+  summary      String   @default("")
+  /// Long-form body (markdown). Rendered on the lore detail page.
+  body         String   @default("")
+  /// Optional cover image asset id.
+  coverAssetId String?
+  /// Optional faction this lore belongs to (e.g. character → faction).
+  factionId    String?
+  /// Optional set this lore is canon for (e.g. event → set "CORE").
+  setId        String?
+  /// Free-form relation list — see model docstring.
+  relationsJson Json    @default("[]")
+  /// Free-form metadata — birth/death dates, region, era, alignment, etc.
+  metadataJson Json     @default("{}")
+  /// Visibility (sec 14.12): private | internal | public_after_release | public.
+  visibility   String   @default("private")
+  /// draft | review | approved | released | archived
+  status       String   @default("draft")
+  sortOrder    Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([projectId, kind])
+}
+
+/// A block (sec 27.3) groups related sets — typically a story arc or a
+/// year's worth of releases. Sets can optionally belong to a block; sets
+/// without a block are still valid (think one-shot promo releases).
+///
+/// Fields beyond the bare identity (storyArc, mechanics, etc.) are kept
+/// free-form on `metadataJson` to avoid schema churn while the spec
+/// settles. The CMS / public site reads them as labelled callouts.
+model Block {
+  id          String   @id @default(cuid())
+  tenantId    String
+  projectId   String
+  name        String
+  slug        String
+  description String   @default("")
+  /// Hex color used for badges / theming (e.g. "#7a4ed1").
+  color       String   @default("#888888")
+  /// Display order within the project (lower = earlier in pickers).
+  sortOrder   Int      @default(0)
+  /// Free-form metadata — story arc summary, draft environment, mechanics,
+  /// release schedule. Validated only at the client; the API treats it as
+  /// opaque so authors can extend the shape per project.
+  metadataJson Json    @default("{}")
+  /// draft | active | concluded | archived
+  status      String   @default("draft")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sets    Set[]
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// A keyword (sec 25) is a reusable rules term — Swift, Ward, Lifebind, etc.
+/// One project owns its keyword glossary. Cards reference keywords by name
+/// or slug from `dataJson.keywords` (free-form for now; structured linking
+/// lands when the rules engine ships).
+model Keyword {
+  id              String  @id @default(cuid())
+  tenantId        String
+  projectId       String
+  name            String
+  /// URL-safe identifier; unique inside the project.
+  slug            String
+  /// Short italicized text shown on cards (e.g. "(...gains haste)"). Kept
+  /// short so it fits in a rules box.
+  reminderText    String  @default("")
+  /// Long-form formal definition for the rulebook / FAQ.
+  rulesDefinition String  @default("")
+  /// Author-defined category (evergreen, deciduous, set-specific, …).
+  category        String  @default("general")
+  /// Structured parameter shape — empty array for nullary keywords. Each item
+  /// is { name: string, type: "number" | "text", min?, max?, default? }.
+  parametersJson  Json    @default("[]")
+  /// Optional icon asset id from the asset library.
+  iconAssetId     String?
+  /// Optional accent color (hex) for icon / glossary entry.
+  color           String?
+  /// draft | approved | deprecated (sec 25 status conventions).
+  status          String  @default("draft")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// A faction (sec 28) groups cards by identity, mechanics, and visuals.
+/// Cards reference factions free-form via `dataJson.faction` (mono) or
+/// `dataJson.factions` (multi). The faction record carries the visual
+/// hooks the variant system uses to swap frame art / cost icons / etc.
+model Faction {
+  id          String  @id @default(cuid())
+  tenantId    String
+  projectId   String
+  name        String
+  /// URL-safe identifier; unique inside the project.
+  slug        String
+  description String  @default("")
+  /// Hex color used for badges / variant tinting (e.g. "#b34a40").
+  color       String  @default("#888888")
+  /// Optional faction icon (asset id from the asset library) — small,
+  /// used in cost slots / card badges / picker tiles.
+  iconAssetId String?
+  /// Optional faction banner / portrait (asset id) — the large-format
+  /// image used on lore pages, the public faction profile, the
+  /// faction-pick screen header, and decklist hero strips. Distinct
+  /// from `iconAssetId` so each can be sized appropriately.
+  imageAssetId String?
+  /// Optional default frame art (asset id) — picked up by image layer
+  /// variants matching `faction == this.slug`.
+  frameAssetId String?
+  /// Free-form list of associated keyword slugs / mechanic names.
+  mechanicsJson Json @default("[]")
+  /// Long-form lore / character notes for the rulebook + public CMS.
+  lore        String  @default("")
+  /// draft | approved | deprecated (mirrors Keyword.status conventions).
+  status      String  @default("draft")
+  /// Display order within the project (lower = earlier in pickers).
+  sortOrder   Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// A set bundles cards for a release (sec 27). Code is the short identifier
+/// printed on cards (e.g. "CORE", "MYT"). One project can have many sets;
+/// a card belongs to at most one set.
+model Set {
+  id          String    @id @default(cuid())
+  tenantId    String
+  projectId   String
+  /// Optional parent block — sec 27.3. Sets can belong to a block (story
+  /// arc / season) or stand alone (one-off promo).
+  blockId     String?
+  name        String
+  /// Short code printed on cards. Conventionally 2-4 uppercase letters.
+  code        String
+  description String    @default("")
+  /// Optional release date — used to sort + display "upcoming" vs "released".
+  releaseDate DateTime?
+  /// draft | design | playtesting | locked | released | archived (sec 27.2)
+  status      String    @default("draft")
+  /// Pack-generation rules (sec 27.4). Shape:
+  /// {
+  ///   "slots": [{ "rarity": "common", "count": 8 }, ...],
+  ///   "totalCount": 15,                  // optional override
+  ///   "duplicates": false,               // disallow duplicate names per pack
+  /// }
+  /// Empty / null means "no pack profile defined yet".
+  packRulesJson Json     @default("{}")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  block   Block?  @relation(fields: [blockId], references: [id], onDelete: SetNull)
+  cards   Card[]
+
+  @@unique([projectId, code])
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([blockId])
+}
+
+/// A card type defines layout + schema for one family of cards (Character,
+/// Source, Spell). The actual layout JSON lives on the linked Template;
+/// the field shape sits in `schemaJson`. See spec sec 17 + sec 22.
+model CardType {
+  id           String   @id @default(cuid())
+  tenantId     String
+  projectId    String
+  name         String
+  slug         String
+  description  String   @default("")
+  /// Schema definition (Field[]). Validated against zod at the API layer.
+  schemaJson   Json     @default("{\"fields\":[]}")
+  /// draft | review | approved | released | deprecated | archived (sec 17.4)
+  status       String   @default("draft")
+  /// Optional pointer to the active template for this card type. A card type
+  /// may have many templates over time (revisions); this is the current one.
+  activeTemplateId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  templates Template[]
+  cards     Card[]
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// The visual template — the on-disk JSON the Card Type Designer produces
+/// (the `CardTypeTemplate` shape from apps/designer/src/types.ts). Stored
+/// verbatim in `contentJson` for v0; we'll normalize to relational rows when
+/// we need server-side rendering or partial updates.
+model Template {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String
+  cardTypeId String
+  name       String
+  /// Bumped on every save. The designer can use this for optimistic-concurrency
+  /// later ("you saved over a newer version, reload?").
+  version    Int      @default(1)
+  /// The full template document — mirrors the local "Save Template" file format.
+  contentJson Json
+  status     String   @default("draft")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project  Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  cardType CardType @relation(fields: [cardTypeId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([cardTypeId])
+}
+
+/// One concrete card with content (sec 18). The `dataJson` map keys to the
+/// schema fields on its CardType. We don't column-ify here because the schema
+/// is user-defined per card type.
+model Card {
+  id           String   @id @default(cuid())
+  tenantId     String
+  projectId    String
+  cardTypeId   String
+  /// Optional set membership. Null while a card is "set-less" / unreleased.
+  setId        String?
+  name         String
+  slug         String
+  /// Field-keyed map: { name: "Ember Knight", cost: 3, rules_text: "..." }
+  dataJson     Json     @default("{}")
+  /// idea | draft | needs_review | approved | released | banned | archived (sec 18.3)
+  status       String   @default("draft")
+  collectorNumber Int?
+  rarity       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project  Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  cardType CardType @relation(fields: [cardTypeId], references: [id], onDelete: Cascade)
+  set      Set?     @relation(fields: [setId], references: [id], onDelete: SetNull)
+  deckCards DeckCard[]
+  versions CardVersion[]
+  comments CardComment[]
+
+  @@unique([projectId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([cardTypeId])
+  @@index([setId])
+}
+
+/// Snapshot of a Card's editable state at a point in time (sec 46.2).
+/// Written by the cards PATCH route before applying the new state, so
+/// every saved edit becomes a restorable revision.
+///
+/// We keep snapshots lightweight — only the fields a designer can
+/// edit (name, slug, status, dataJson, rarity, collectorNumber,
+/// cardTypeId, setId) plus the actor and an optional note. Computed
+/// fields (createdAt on the parent, etc.) are derived on read.
+///
+/// `versionNum` increments per card and is computed server-side. The
+/// first snapshot of a card is version 1.
+model CardVersion {
+  id              String   @id @default(cuid())
+  tenantId        String
+  cardId          String
+  versionNum      Int
+  name            String
+  slug            String
+  status          String
+  rarity          String?
+  collectorNumber Int?
+  cardTypeId      String
+  setId           String?
+  dataJson        Json     @default("{}")
+  /// Free-form note — "balance pass", "art swap", "rules wording", etc.
+  note            String   @default("")
+  /// Actor user id. Nullable so seed rows / API-key writes don't break.
+  createdBy       String?
+  createdAt       DateTime @default(now())
+
+  card Card @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@unique([cardId, versionNum])
+  @@index([tenantId])
+  @@index([cardId])
+}
+
+/// A comment / review note attached to a Card (sec 18.4).
+///
+/// Two shapes share this model:
+///
+///   1. Standalone comments — a reviewer leaves notes on a card.
+///      These can be threaded via `parentId` (one level deep is the
+///      typical case; deeper threads work but the UI flattens them).
+///
+///   2. Approval-flow markers — when an editor approves or requests
+///      changes, we write a comment with `kind` set to `approval` /
+///      `change_request`. This gives the timeline a single
+///      chronological narrative instead of a separate audit-only
+///      log the user can't read.
+///
+/// Resolution: a top-level comment can be resolved (`resolvedAt`
+/// non-null) when the issue it raised has been addressed. Resolved
+/// comments are hidden by default in the drawer; users can toggle
+/// them back on.
+model CardComment {
+  id         String    @id @default(cuid())
+  tenantId   String
+  cardId     String
+  /// Author user id. Required — we don't accept anonymous review.
+  userId     String
+  /// Optional parent comment id for one-level threading.
+  parentId   String?
+  /// "comment" | "approval" | "change_request" — drives icon + color.
+  kind       String    @default("comment")
+  body       String
+  /// Optional reference to a card version this comment was made
+  /// against — lets reviewers re-anchor stale comments after a
+  /// restore / large edit.
+  versionId  String?
+  resolvedAt DateTime?
+  resolvedBy String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  card Card @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([cardId])
+  @@index([cardId, parentId])
+  @@index([userId])
+}
+
+/// Catch-all for uploaded assets — frames, art, fonts, icons (sec 20).
+/// Files themselves live in object storage (MinIO/S3). `storageKey` is the
+/// path inside the tenant bucket.
+model Asset {
+  id         String   @id @default(cuid())
+  tenantId   String
+  projectId  String?
+  /// Folder this asset lives in. Null = root of the asset tree.
+  /// Folders are tenant or project scoped to mirror the asset's own
+  /// scope; the route layer enforces consistency.
+  folderId   String?
+  name       String
+  slug       String
+  /// frame | nameplate | art | icon | font | document | export | other
+  type       String   @default("other")
+  mimeType   String
+  fileSize   Int
+  width      Int?
+  height     Int?
+  /// Storage path key (e.g. "tenants/<tid>/projects/<pid>/assets/<id>.png").
+  storageKey String
+  /// private | tenant_internal | project_internal | public (sec 20.4)
+  visibility String   @default("private")
+  /// Approval workflow (sec 33.4 — validation gates). New uploads
+  /// land as `draft`; the uploader marks them `pending` to submit
+  /// for review; an approver moves them to `approved` (usable in
+  /// cards / templates) or `rejected` (with a reason in
+  /// `approvalNote`). Card / template renderers refuse to bind
+  /// non-approved assets unless explicitly opted in.
+  ///   draft | pending | approved | rejected
+  status        String  @default("draft")
+  /// Latest reviewer comment — visible to the uploader so they know
+  /// why a rejection happened or what was accepted.
+  approvalNote  String  @default("")
+  /// User id of the reviewer who set the current status. Null while
+  /// the asset is still in draft.
+  approvedBy    String?
+  approvedAt    DateTime?
+  /// Free-form metadata. Carries asset-level config the client cares about
+  /// but the API doesn't have to model relationally — most importantly:
+  ///   - 9-slice insets: { slice: { top, right, bottom, left } }
+  ///   - tags, license, author (sec 20.3 fields)
+  ///   - per-asset color palette / DPI hints
+  metadataJson Json    @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project?     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  folder  AssetFolder? @relation(fields: [folderId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([folderId])
+  @@index([status])
+}
+
+/// Folder in the asset library (sec 20). Tenant or project scoped to
+/// mirror the assets they hold; nested arbitrarily through `parentId`.
+/// Renaming a folder is cheap (just the `name`); moving is also cheap
+/// — we only update `parentId`. The UI computes paths by walking up.
+model AssetFolder {
+  id        String   @id @default(cuid())
+  tenantId  String
+  projectId String?
+  parentId  String?
+  name      String
+  slug      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project  Project?      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  parent   AssetFolder?  @relation("AssetFolderTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children AssetFolder[] @relation("AssetFolderTree")
+  assets   Asset[]
+
+  @@unique([tenantId, parentId, slug])
+  @@index([tenantId, projectId])
+  @@index([parentId])
+}
+
+/// A public website surface owned by a tenant (sec 14.1–14.3). Two
+/// canonical kinds:
+///
+///   • `kind="studio"` — the tenant's umbrella public site. One per
+///     tenant max. Lives at the tenant's root domain (or
+///     `<slug>.tcgstudio.local`).
+///   • `kind="game"` — a project-scoped public site. Lives at the
+///     project subdomain (`<projectSlug>.<tenantSlug>.tcgstudio.local`)
+///     or at a custom domain pointed at the project (sec 14.2).
+///
+/// We don't model brand here — multi-brand support comes later. For
+/// now a tenant has one studio site and zero-or-more game sites.
+///
+/// `themeJson` carries colors / typography / layout tokens. That's
+/// kept as JSON so plugins / future themes can extend the shape
+/// without schema migrations (sec 14.4 page builder is theme-aware).
+model CmsSite {
+  id          String   @id @default(cuid())
+  tenantId    String
+  projectId   String?
+  /// studio | game | gallery | rules | lore | event (sec 14.2)
+  kind        String   @default("studio")
+  name        String
+  /// URL-safe slug, unique inside the tenant. For studio sites this
+  /// is usually "main" or the tenant slug; for game sites typically
+  /// matches the project slug.
+  slug        String
+  description String   @default("")
+  /// Theme tokens (colors, typography, layout). Free-form so themes
+  /// can ship as plugin packages later (sec 14.4 / 35.2).
+  themeJson   Json     @default("{}")
+  /// Site-wide settings: locale, default OG image asset, sitemap on/off,
+  /// public/private flag overrides, robots policy. (sec 14.13)
+  settingsJson Json    @default("{}")
+  /// draft | published | archived
+  status      String   @default("draft")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  pages   CmsPage[]
+  navigations CmsNavigation[]
+  forms   CmsForm[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// A page on a CMS site (sec 14.4). The block tree lives inline in
+/// `contentJson` rather than a separate `cms_blocks` table — much
+/// simpler to read/write atomically, and pages are always loaded as
+/// a unit anyway. We add a relational blocks table later if we need
+/// per-block analytics or fine-grained permissions.
+///
+/// Lifecycle (sec 14.10):
+///   draft → in_review → approved → scheduled → published → unpublished → archived
+///
+/// We hold the *currently published* block tree as a snapshot in
+/// `publishedJson` so live readers never see a half-saved draft. The
+/// editor mutates `contentJson`; publishing copies it to
+/// `publishedJson` and bumps `publishedAt`.
+model CmsPage {
+  id           String   @id @default(cuid())
+  tenantId     String
+  siteId       String
+  /// URL slug within the site. "/" maps to slug "" or "home"; we
+  /// treat "" as the site root by convention.
+  slug         String
+  title        String
+  /// SEO description (sec 14.13). 160 chars max enforced at API.
+  seoDescription String @default("")
+  /// Open Graph + meta overrides (canonicalUrl, ogTitle, ogImageAssetId,
+  /// twitterCard, robots, structuredDataType).
+  seoJson      Json    @default("{}")
+  /// Block tree authored by the editor (sec 14.4 / 14.5). Free-form so
+  /// plugins can register new block types without DB migrations. Shape:
+  ///   { blocks: [ { id, type, props, children? }, ... ] }
+  contentJson  Json    @default("{\"blocks\":[]}")
+  /// Snapshot of the most recently published block tree. Public reads
+  /// hit THIS field, not contentJson.
+  publishedJson Json   @default("{\"blocks\":[]}")
+  /// Per-locale translation overrides (sec 47). Shape:
+  ///   {
+  ///     "de": { "title": "...", "seoDescription": "...",
+  ///             "publishedJson": { "blocks": [...] } },
+  ///     "fr": { ... }
+  ///   }
+  /// When the renderer resolves a page for locale X, it merges this
+  /// locale's overrides on top of the base fields. Locales that
+  /// aren't in the map fall back to the base content automatically.
+  translationsJson Json @default("{}")
+  /// draft | in_review | approved | scheduled | published | unpublished | archived (sec 14.10)
+  status       String   @default("draft")
+  /// private | internal_only | preview_only | public | public_after_release | hidden_but_linkable | archived_public (sec 14.12)
+  visibility   String   @default("public")
+  /// When the next scheduled publish should fire (UTC).
+  scheduledAt  DateTime?
+  publishedAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  site     CmsSite          @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  versions CmsPageVersion[]
+
+  @@unique([siteId, slug])
+  @@index([tenantId])
+  @@index([siteId])
+  @@index([status])
+}
+
+/// Snapshot of a CmsPage's content + status at a point in time (sec
+/// 46.2). Created on publish/unpublish/restore so users can roll back.
+/// Kept lightweight — title, slug, status, contentJson at that
+/// moment, plus the actor who triggered it.
+model CmsPageVersion {
+  id          String   @id @default(cuid())
+  tenantId    String
+  pageId      String
+  /// Increments per page; first version is 1. The API computes this.
+  versionNum  Int
+  title       String
+  slug        String
+  status      String
+  contentJson Json     @default("{\"blocks\":[]}")
+  /// Free-form note ("editorial pass", "scheduled launch", etc).
+  note        String   @default("")
+  /// User id of the actor who created the version. Nullable so seed
+  /// rows / system actions don't break the FK.
+  createdBy   String?
+  createdAt   DateTime @default(now())
+
+  page CmsPage @relation(fields: [pageId], references: [id], onDelete: Cascade)
+
+  @@unique([pageId, versionNum])
+  @@index([tenantId])
+  @@index([pageId])
+}
+
+/// A navigation menu attached to a site (sec 14.14). Items live as a
+/// JSON tree on this row — links can point at internal pages, external
+/// URLs, card galleries, or other site routes.
+///
+/// Common placements: header, footer, mobile, sidebar, rules, lore.
+/// A site can have many menus, one per placement.
+model CmsNavigation {
+  id        String   @id @default(cuid())
+  tenantId  String
+  siteId    String
+  /// Where this menu shows: header | footer | mobile | sidebar | rules | lore | custom
+  placement String
+  name      String
+  /// Tree of items. Shape:
+  ///   { items: [ { id, label, kind: "page"|"url"|"gallery"|"section",
+  ///     target?, slug?, children?: [...] }, ... ] }
+  itemsJson Json     @default("{\"items\":[]}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  site CmsSite @relation(fields: [siteId], references: [id], onDelete: Cascade)
+
+  @@unique([siteId, placement])
+  @@index([tenantId])
+  @@index([siteId])
+}
+
+/// A form attached to a CMS site (sec 14.15). Supports contact, playtest
+/// signup, newsletter signup, bug report, etc. The field list lives as
+/// JSON in `fieldsJson` so plugins / future field types extend without
+/// migrations. Shape:
+///   { fields: [
+///       { id, name, label, kind: "text"|"longtext"|"email"|"number"|"checkbox"|"select",
+///         required: bool, placeholder?, helpText?, options?: [{value,label}], ... },
+///       ...
+///     ] }
+///
+/// Submissions are stored separately (CmsFormSubmission). The form
+/// itself stores delivery preferences (email-on-submit recipients,
+/// webhook URLs) via `settingsJson`.
+model CmsForm {
+  id          String   @id @default(cuid())
+  tenantId    String
+  siteId      String
+  /// URL-safe slug, unique per site. Used by /api/public/.../forms/:slug/submit.
+  slug        String
+  name        String
+  description String   @default("")
+  /// Field list — see header comment.
+  fieldsJson  Json     @default("{\"fields\":[]}")
+  /// Delivery + spam settings. Common keys:
+  ///   - emailRecipients: string[] (cc'd on submit)
+  ///   - webhookUrl: string (optional POST target)
+  ///   - successMessage: string (shown after successful submit)
+  ///   - rateLimitPerHour: number
+  ///   - requireConsent: bool (for newsletter signup)
+  settingsJson Json    @default("{}")
+  /// draft | active | archived — only "active" forms accept submissions.
+  status      String   @default("draft")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  site        CmsSite             @relation(fields: [siteId], references: [id], onDelete: Cascade)
+  submissions CmsFormSubmission[]
+
+  @@unique([siteId, slug])
+  @@index([tenantId])
+  @@index([siteId])
+}
+
+/// One captured form submission. The payload is whatever fields the
+/// form was configured with at the time of submission, not the current
+/// field shape — this matters because forms can change after capture
+/// (renamed fields, new requirements, etc).
+model CmsFormSubmission {
+  id          String   @id @default(cuid())
+  tenantId    String
+  formId      String
+  /// Captured field values, keyed by field name. Values can be strings,
+  /// numbers, booleans, or arrays (multi-select).
+  payloadJson Json     @default("{}")
+  /// Origin metadata for spam triage and rate-limiting.
+  ip          String?
+  userAgent   String?
+  /// Optional referrer URL — useful for tracking where the form was
+  /// embedded (which page on the site).
+  referrer    String?
+  createdAt   DateTime @default(now())
+
+  form CmsForm @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([formId])
+  @@index([createdAt])
+}
+
+/// Tenant-scoped API key for third-party access (sec 36.7).
+///
+/// We never store the plaintext token — only its sha256 hash. The
+/// plaintext is shown to the creator ONCE on issuance and then never
+/// retrievable. Token format: `tcgs_<32 hex bytes>` so machines /
+/// log scrapers can spot it without parsing the full URL.
+///
+/// Scopes are an array of dot-namespaced strings (`cards:read`,
+/// `assets:write`, `cms:read`, etc.) — the auth plugin compares the
+/// requested route's required scope against this list before
+/// allowing the request.
+model ApiKey {
+  id          String    @id @default(cuid())
+  tenantId    String
+  /// Optional project scope. When set, the key can ONLY access the
+  /// named project's resources — cross-project requests through this
+  /// key return 403. Lets a tenant issue keys for individual game
+  /// integrations without exposing the rest of their workspace.
+  /// Null = tenant-wide key (the historical default).
+  projectId   String?
+  /// Human-readable name for admin UI ("Stats dashboard", "CI bot").
+  name        String
+  /// SHA-256 of the plaintext token, lowercase hex.
+  tokenHash   String    @unique
+  /// First 8 chars of the plaintext, kept for display so the user can
+  /// identify a key in the list ("starts with abc12345…").
+  tokenPrefix String
+  /// Permission scopes (sec 36.7). Null/empty = read-only.
+  scopesJson  Json      @default("[]")
+  /// Optional ISO date — key stops working after this. Null = never.
+  expiresAt   DateTime?
+  /// Updated on every authenticated request that uses this key.
+  lastUsedAt  DateTime?
+  /// User who created this key (audit trail).
+  createdBy   String?
+  /// Manual revocation. Once revoked, no future request can use this
+  /// key; we keep the row around so the audit trail isn't broken.
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// Audit log row (sec 41). One per user-visible action, written by
+/// the helper `writeAudit(...)` in routes that touch security- or
+/// billing-relevant state. Actions are dot-namespaced strings:
+///   tenant.update, project.delete, member.role.change,
+///   domain.add, domain.verify, apikey.create, apikey.revoke,
+///   cms.page.publish, billing.update, ...
+///
+/// Tenant admins can browse this list from Settings; the same rows
+/// also feed into a future SOC 2 / GDPR export.
+model AuditLog {
+  id           String   @id @default(cuid())
+  tenantId     String
+  /// User ID of the actor — null for system actions.
+  actorUserId  String?
+  /// Role of the actor at the time of the action. Frozen — if the
+  /// user's role changes later, this row still reflects what was
+  /// effective when the action ran.
+  actorRole    String?
+  /// Dot-namespaced action identifier.
+  action       String
+  /// Optional entity affected ("project", "domain", "apikey").
+  entityType   String?
+  entityId     String?
+  ipAddress    String?
+  userAgent    String?
+  /// Free-form structured detail. Keep small — limit to 8KiB.
+  metadataJson Json     @default("{}")
+  createdAt    DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+/// Plugin manifest registered on the platform (sec 34). The platform
+/// owner uploads / curates these; tenants then INSTALL them per
+/// PluginInstall to enable in their workspace.
+///
+/// For v0 we model the manifest only — there's no runtime sandboxing
+/// or capability enforcement yet. Tenants see the catalog, can
+/// install/uninstall, and the rest is plumbing for future versions.
+model Plugin {
+  id              String   @id @default(cuid())
+  /// Stable global identifier ("print-export-pro", "tts-deluxe").
+  slug            String   @unique
+  name            String
+  version         String   @default("0.1.0")
+  author          String   @default("")
+  description     String   @default("")
+  /// Free-form manifest blob — declared permissions, contributions,
+  /// settings schema. See `apps/api/src/plugins.md` (future) for the
+  /// canonical shape.
+  manifestJson    Json     @default("{}")
+  /// platform | tenant — at which scope can this plugin be installed?
+  scope           String   @default("tenant")
+  /// draft | review | approved | deprecated
+  status          String   @default("approved")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  installs PluginInstall[]
+}
+
+/// One row per (tenant, plugin) install. Carries tenant-scoped
+/// settings + the enabled flag. Disabled installs stay in the table
+/// so the user can re-enable without losing settings.
+model PluginInstall {
+  id           String   @id @default(cuid())
+  tenantId     String
+  pluginId     String
+  enabled      Boolean  @default(true)
+  /// Tenant-scoped settings, validated against the plugin's
+  /// settingsSchema at install time (when implemented).
+  settingsJson Json     @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  plugin Plugin @relation(fields: [pluginId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, pluginId])
+  @@index([tenantId])
+}
+
+/// In-app notification for a user.
+///
+/// Created by the system when something interesting happens for the
+/// recipient (task assigned, message received, page published, etc).
+/// The notification center polls /api/v1/notifications and pops
+/// unread ones into a dropdown bell.
+model Notification {
+  id         String    @id @default(cuid())
+  userId     String
+  /// Optional tenant scope — null for cross-tenant system messages.
+  tenantId   String?
+  /// Dot-namespaced kind: task.assigned, message.received,
+  /// page.published, mention, system.
+  kind       String
+  title      String
+  body       String    @default("")
+  /// Optional in-app link (`/admin/tasks/abc`) or external URL.
+  link       String?
+  /// Free-form details — sender, entity references, etc.
+  metadataJson Json    @default("{}")
+  readAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, readAt])
+  @@index([createdAt])
+}
+
+/// Tenant-/project-scoped collaboration task.
+///
+/// Different from `AuditLog` (security) and the platform's TodoList
+/// (in-conversation): this is a real persistent kanban-style task
+/// that a designer / artist / writer / playtester can be assigned to.
+model TenantTask {
+  id          String    @id @default(cuid())
+  tenantId    String
+  projectId   String?
+  title       String
+  description String    @default("")
+  /// User id of the person responsible. Null = unassigned.
+  assigneeId  String?
+  /// todo | in_progress | review | done | archived
+  status      String    @default("todo")
+  /// low | normal | high | urgent
+  priority    String    @default("normal")
+  /// Free-form labels — colors and grouping in the UI.
+  labels      Json      @default("[]")
+  dueAt       DateTime?
+  /// Sort order within column. Lower = top. Updated on drag.
+  sortOrder   Int       @default(0)
+  /// Audit fields.
+  createdBy   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  closedAt    DateTime?
+
+  assignee User? @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([assigneeId])
+  @@index([status])
+}
+
+/// A messaging channel within a tenant. Tenants get a default
+/// `#general` channel on creation; admins can add more (per project,
+/// per role, etc).
+model Channel {
+  id          String    @id @default(cuid())
+  tenantId    String
+  /// Channel slug — kebab-case, unique per tenant.
+  slug        String
+  name        String
+  description String    @default("")
+  /// Optional project scope. Null = tenant-wide.
+  projectId   String?
+  /// public | private — public channels appear in every member's
+  /// sidebar; private channels require explicit membership (future).
+  visibility  String    @default("public")
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  messages Message[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+}
+
+/// A message in a Channel.
+///
+/// v0 — plain text body + author. Threading, reactions, and
+/// attachments come later. We store rendered HTML at send time so
+/// existing rows survive markdown-renderer upgrades.
+model Message {
+  id        String   @id @default(cuid())
+  tenantId  String
+  channelId String
+  authorId  String
+  body      String
+  /// Rendered HTML — what the client paints. Server sanitizes before
+  /// storing.
+  bodyHtml  String   @default("")
+  /// Edited-message marker so the UI shows "(edited)".
+  editedAt  DateTime?
+  /// Soft delete — hidden from feed but the row stays for audit.
+  deletedAt DateTime?
+  createdAt DateTime @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([channelId])
+  @@index([channelId, createdAt])
+}
+
+/// Project-level milestone for the planning view.
+///
+/// Loose: a milestone is just a named bucket with a target date. The
+/// planning view groups TenantTasks by milestone and renders a
+/// timeline. Tasks reference a milestone via metadata, not a hard
+/// FK — we let users move tasks around without cascade headaches.
+model Milestone {
+  id          String    @id @default(cuid())
+  tenantId    String
+  projectId   String
+  name        String
+  description String    @default("")
+  /// upcoming | active | done | cancelled
+  status      String    @default("upcoming")
+  startAt     DateTime?
+  dueAt       DateTime?
+  closedAt    DateTime?
+  /// Display ordering when multiple milestones share dates.
+  sortOrder   Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([status])
+}
+
+/// Tenant-scoped webhook subscription (sec 36 / 41).
+///
+/// When a tenant event fires (apikey.create, cms.page.publish, etc.),
+/// the dispatcher iterates Webhooks whose `events` array matches the
+/// fired event and POSTs the payload to `targetUrl`. Each delivery
+/// is logged in WebhookDelivery so the user can debug failures.
+///
+/// Signing: every request carries `X-Tcgs-Signature: t=<unix>,v1=<hex>`
+/// where v1 is HMAC-SHA256(secret, `<unix>.<rawBody>`). The receiver
+/// computes the same hash and compares constant-time. We use the `t`
+/// timestamp to reject replays older than 5 minutes.
+model Webhook {
+  id          String   @id @default(cuid())
+  tenantId    String
+  /// Display label for the admin UI ("Discord notifier", "CI bot").
+  name        String
+  /// HTTPS POST target.
+  targetUrl   String
+  /// Random 32-byte hex secret used as the HMAC key. Returned in
+  /// plaintext on creation; routes never echo it again.
+  secret      String
+  /// Dot-namespaced event filter ("apikey.*", "cms.page.publish").
+  /// "*" wildcard at the end matches any sub-action.
+  events      Json     @default("[]")
+  /// Manual disable. Disabled subscriptions stay around but skip
+  /// dispatch — useful for "pause this hook while we debug".
+  enabled     Boolean  @default(true)
+  /// Updated on every successful delivery.
+  lastSuccessAt DateTime?
+  /// Updated on every failed delivery (4xx/5xx/timeout).
+  lastFailureAt DateTime?
+  /// Auto-disabled after this many consecutive failures. 0 = no auto-disable.
+  failureBackoff Int @default(20)
+  /// Consecutive failure counter — reset on success.
+  consecutiveFailures Int @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant     Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([tenantId])
+}
+
+/// Result of a single webhook dispatch attempt.
+model WebhookDelivery {
+  id         String   @id @default(cuid())
+  webhookId  String
+  /// Event that fired ("cms.page.publish").
+  event      String
+  /// Serialized payload (the same body we POSTed).
+  payloadJson Json    @default("{}")
+  /// HTTP response status, or null when the request didn't complete
+  /// (DNS failure, timeout, etc).
+  responseStatus Int?
+  /// First ~2 KiB of the response body, for debugging.
+  responseBody String?
+  /// True when 2xx, false otherwise.
+  ok         Boolean
+  /// Free-form note: "timeout", "ssl_error", "rate_limited", etc.
+  errorCode  String?
+  /// Round-trip duration in ms.
+  durationMs Int?
+  createdAt  DateTime @default(now())
+
+  webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([webhookId])
+  @@index([webhookId, createdAt])
+  @@index([createdAt])
+}
+
+/// Background job (sec 38).
+///
+/// Heavy operations — PDF print sheets, project export bundles,
+/// bulk imports, search indexing — get queued here instead of
+/// running inline. The worker (started in-process by the API
+/// container for v0; can move to a separate process later) polls
+/// the queued rows and dispatches to a registered handler.
+///
+/// Job lifecycle:
+///   queued → running → completed | failed | cancelled
+///
+/// Failed jobs can retry up to `maxAttempts` times. Each attempt
+/// records its error in `lastError`. Retry timing is exponential
+/// (`nextRunAt = now + 2^attempt seconds`).
+///
+/// `payloadJson` is the input — a small JSON blob the handler
+/// understands. `resultJson` carries the output (e.g. an asset id
+/// pointing at the rendered PDF). Both are tenant-scoped.
+model Job {
+  id          String    @id @default(cuid())
+  tenantId    String
+  /// Dot-namespaced handler key — e.g. `export.pdf.print_sheet`,
+  /// `export.project.bundle`, `cms.publish.scheduled`.
+  type        String
+  /// queued | running | completed | failed | cancelled
+  status      String    @default("queued")
+  payloadJson Json      @default("{}")
+  resultJson  Json?
+  /// Free-form error message from the most recent failed attempt.
+  lastError   String?
+  /// Number of attempts already made (counts the current run).
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(3)
+  /// Earliest time the worker may pick this up (used for retries).
+  nextRunAt   DateTime  @default(now())
+  /// When the worker claimed the job; cleared on completion.
+  startedAt   DateTime?
+  completedAt DateTime?
+  /// Optional creator (user who enqueued).
+  createdBy   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status, nextRunAt])
+  @@index([type])
+}
+
+/// Subscription plan (sec 42).
+///
+/// Plans drive feature flags + numeric limits. The platform owner
+/// publishes the catalog (Free Creator / Solo Pro / Studio /
+/// Publisher / Enterprise / etc); each tenant references one plan
+/// via `Tenant.planId`.
+///
+/// Limits are stored as JSON so we can extend the shape without
+/// migrations. Convention:
+///   {
+///     "limits": {
+///       "projects": 3,
+///       "members": 5,
+///       "storageMiB": 1024,
+///       "exportsPerMonth": 50,
+///       "customDomains": 0,
+///       "apiKeys": 1,
+///       "webhooks": 0,
+///       "plugins": 0
+///     },
+///     "features": {
+///       "whiteLabel": false,
+///       "sso": false,
+///       "advancedExports": false,
+///       "publicMarketplacePublishing": false
+///     }
+///   }
+///
+/// A `null`/missing limit means "unlimited"; `0` means "explicitly
+/// disabled". The enforcement helper handles both.
+model Plan {
+  id          String  @id @default(cuid())
+  /// URL-safe identifier ("free", "studio", "enterprise").
+  slug        String  @unique
+  name        String
+  description String  @default("")
+  /// Shown to users picking a plan. USD by default; multi-currency
+  /// support lives behind a future flag.
+  priceCents  Int     @default(0)
+  /// "monthly" | "yearly" | "free"
+  billingPeriod String @default("free")
+  /// Display ordering on the plan picker.
+  sortOrder   Int     @default(0)
+  /// hidden | active | deprecated — the picker only shows "active".
+  status      String  @default("active")
+  /// Limits + feature flags blob (see header comment).
+  limitsJson  Json    @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenants Tenant[]
+}
+
+/// Platform-wide announcement banner. Shown across every tenant's
+/// admin shell as a thin pinned strip until the recipient
+/// dismisses it (per-user `dismissedAt` lives on the client for
+/// v0). Used for incident notices, planned-maintenance windows,
+/// and big-launch marketing pushes.
+model PlatformAnnouncement {
+  id          String   @id @default(cuid())
+  /// info | warning | maintenance | marketing
+  kind        String   @default("info")
+  /// Plain-text headline shown in the banner.
+  headline    String
+  /// Optional follow-up body. Markdown-flavored, rendered in a
+  /// "View details" expansion.
+  body        String   @default("")
+  /// Optional call-to-action target.
+  ctaLabel    String?
+  ctaUrl      String?
+  /// Window where the banner is live. Both nullable — null start
+  /// means "from creation", null end means "until dismissed".
+  startsAt    DateTime?
+  endsAt      DateTime?
+  /// draft | active | archived
+  status      String   @default("draft")
+  /// User id of the platform admin who authored it.
+  createdBy   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+}
+
+/// Role definition (sec 13). Replaces the hardcoded role enum on
+/// Membership / ProjectMembership / User.platformRole — those still
+/// store the role *slug*, but the slug is now resolved through this
+/// table to a list of permission strings, which is what the
+/// authorization helpers actually check.
+///
+/// Scope rules:
+///   - `platform` roles: tenantId must be null. Slugs follow the
+///     legacy enum (owner / admin / support) plus any custom ones
+///     the platform owner creates. Granted via User.platformRole.
+///   - `tenant` roles: tenantId must be the owning tenant. Built-in
+///     slugs (tenant_owner, tenant_admin, billing_admin, ...) are
+///     seeded once-per-tenant on tenant create; tenant admins can
+///     add custom roles below.
+///   - `project` roles: tenantId is the owning tenant; built-in
+///     slugs (project_owner, project_admin, game_designer, ...)
+///     are shared across every project in the tenant.
+///
+/// `isSystem == true` rows are protected: the API refuses to edit or
+/// delete them. Custom roles authored by admins are isSystem=false
+/// and can be freely modified.
+model Role {
+  id           String   @id @default(cuid())
+  /// platform | tenant | project
+  scope        String
+  /// Null for platform-scope. Set to the owning tenant for
+  /// tenant-scope and project-scope roles.
+  tenantId     String?
+  name         String
+  /// URL-safe stable identifier used by Membership.role,
+  /// ProjectMembership.role, and User.platformRole as the FK.
+  slug         String
+  description  String   @default("")
+  /// JSON array of permission strings — see PERMISSION_CATALOG in
+  /// `lib/permissions.ts`. Wildcards allowed (`tenants:*` grants
+  /// every tenants:* permission).
+  permissionsJson Json   @default("[]")
+  /// Built-in roles can't be deleted or have their permissions
+  /// shrunk. Custom roles default to isSystem=false.
+  isSystem     Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([scope, tenantId, slug])
+  @@index([scope, tenantId])
+}
+
+/// Invitation (sec 12.4). One model, three scopes:
+///
+///   • scope=platform — tenantId/projectId both null. Redeems by
+///     setting the user's `platformRole`. Only platform admins can
+///     mint these.
+///   • scope=tenant — tenantId set, projectId null. Redeems by
+///     creating a Membership row.
+///   • scope=project — both set. Redeems by creating a Membership
+///     (if not already a tenant member) AND a ProjectMembership.
+///
+/// When an admin invites someone:
+///   • The invitee already has a TCGStudio account → we skip this
+///     table and create the membership row directly.
+///   • The invitee doesn't have an account → we store an Invitation
+///     with a redemption token. They click the emailed link, sign
+///     up, and the post-signup hook turns the pending invite into
+///     the appropriate memberships.
+model Invitation {
+  id          String   @id @default(cuid())
+  /// platform | tenant | project
+  scope       String
+  /// Null for platform-scope.
+  tenantId    String?
+  /// Null for platform + tenant scope.
+  projectId   String?
+  email       String
+  /// Role to grant on redemption. Must be a valid Role.slug at the
+  /// matching scope.
+  role        String
+  /// Random 32-byte hex token; the redemption URL carries this.
+  token       String   @unique
+  /// pending | accepted | expired | revoked
+  status      String   @default("pending")
+  invitedBy   String?
+  /// Optional message included in the email.
+  message     String   @default("")
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant  Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([scope, status])
+  @@index([tenantId, status])
+  @@index([projectId])
+  @@index([email])
+}
+
+/// Support ticket (sec 8 — support is part of every plan). Tickets
+/// flow up the hierarchy:
+///
+///   • Project users open tickets at scope="project" — they go to
+///     the parent tenant's admins.
+///   • Tenant admins open tickets at scope="tenant" — they go to
+///     platform support.
+///   • Platform admins open tickets at scope="platform" — these are
+///     internal (e.g. cross-team) and don't escalate further.
+///
+/// Replies live on `SupportReply`; resolution lives on the ticket
+/// itself (`status`, `closedAt`).
+model SupportTicket {
+  id          String   @id @default(cuid())
+  /// Where the ticket originated. Tenants are addressable through
+  /// `tenantId`; projects through `projectId` (which carries the
+  /// tenantId via Project.tenantId for routing).
+  scope       String
+  tenantId    String?
+  projectId   String?
+  /// Where the ticket is going — `tenant` (tenant admins handle it)
+  /// or `platform` (platform support). Derived at create time and
+  /// stored so the queue endpoints don't have to recompute it.
+  routedTo    String
+  /// User who filed the ticket.
+  submitterId String
+  subject     String
+  body        String
+  /// open | in_progress | resolved | closed
+  status      String   @default("open")
+  /// low | normal | high | urgent
+  priority    String   @default("normal")
+  /// Optional category — "billing", "bug", "feature", "abuse", etc.
+  category    String?
+  closedAt    DateTime?
+  /// User who closed/resolved it (audit trail).
+  closedBy    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant    Tenant?         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  project   Project?        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  replies   SupportReply[]
+
+  @@index([routedTo, status])
+  @@index([submitterId])
+  @@index([tenantId])
+  @@index([projectId])
+}
+
+/// Threaded reply on a SupportTicket. `authorRole` records whether
+/// the reply came from the submitter or from the receiving admin so
+/// the UI can render the bubble alignment correctly.
+model SupportReply {
+  id        String   @id @default(cuid())
+  ticketId  String
+  authorId  String
+  /// "submitter" | "responder"
+  authorRole String
+  body      String
+  createdAt DateTime @default(now())
+
+  ticket SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+}
+
+/// Platform-wide settings — singleton table (one row, id = "default").
+/// Holds the theme/branding tokens for the platform shell itself
+/// (landing page, login, default email styles), and any other
+/// platform-level config that doesn't deserve its own model. Tenants
+/// inherit defaults from here when they don't override.
+model PlatformSetting {
+  id           String   @id @default("default")
+  /// Theme tokens — colors, typography, layout density. Same shape as
+  /// `Tenant.brandingJson` so the same renderer can consume both.
+  brandingJson Json     @default("{}")
+  updatedAt    DateTime @updatedAt
+  updatedBy    String?
+}
+
+// ----------------------------------------------------------------------------
+// Marketplace (sec 35)
+// ----------------------------------------------------------------------------
+//
+// The marketplace is how tenants discover and install packages
+// authored by other tenants or by the platform itself. A "package" is
+// the unit of distribution — it could wrap a Plugin (the runtime
+// extension), a CMS theme, an asset pack (frames/icons/fonts), a
+// rules pack, or a starter kit. Each kind has different unpack
+// semantics on install (see lib/marketplace.ts).
+//
+// Three layers:
+//
+//   1. MarketplacePublisher — a tenant can register as a publisher to
+//      author packages. Verification is set by platform admin.
+//
+//   2. MarketplacePackage — the catalog row. Has metadata (name,
+//      description, kind, category, price, gallery, ratings) and links
+//      to a publisher. Versions live one-to-many off this row so the
+//      catalog page can show changelog history.
+//
+//   3. MarketplaceInstall — one row per (tenant, package) install.
+//      Pinned to a specific version (`versionId`) or null for "track
+//      latest". Reviews are scoped per (tenant, package).
+//
+// Scope split: `scope=platform` packages show in the global directory;
+// `scope=tenant` packages are tenant-private (e.g. an enterprise
+// publishing internal-only theme presets to its own staff).
+
+/// A publisher identity attached to a tenant. Lets the tenant author
+/// marketplace packages under a brand name distinct from their tenant
+/// slug. Used for verification badges and storefront pages.
+model MarketplacePublisher {
+  id          String   @id @default(cuid())
+  tenantId    String   @unique
+  /// Brand-public display name shown on package cards.
+  displayName String
+  /// Set true by platform admins after manual review.
+  verified    Boolean  @default(false)
+  bio         String   @default("")
+  websiteUrl  String   @default("")
+  /// Optional logo asset (must belong to the same tenant).
+  iconAssetId String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  packages MarketplacePackage[]
+}
+
+/// A publishable bundle. Wraps metadata for catalog browsing and links
+/// to one-to-many MarketplacePackageVersion rows for the actual
+/// payload. Install side-effects depend on `kind`.
+model MarketplacePackage {
+  id          String   @id @default(cuid())
+  /// Stable URL slug: "fire-frame-pack", "print-export-pro".
+  slug        String   @unique
+  name        String
+  /// One of: plugin | frame_pack | icon_pack | font_pack | rules_pack |
+  /// ability_pack | exporter | starter_kit | cms_theme | cms_block_pack |
+  /// board_layout | print_profile | pack_generator
+  kind        String
+  /// Browsing category — "Visuals", "Production", "Rules", "Education", ...
+  category    String?
+  /// Short tagline shown on package tiles.
+  summary     String   @default("")
+  /// Long-form description (markdown allowed).
+  description String   @default("")
+  /// Denormalized author display (publisher name or "TCGStudio").
+  authorName  String   @default("")
+  publisherId String?
+  /// Cents; 0 = free.
+  priceCents  Int      @default(0)
+  /// "platform" — listed on the public directory.
+  /// "tenant"   — visible only to the owning tenant (private listing).
+  scope       String   @default("platform")
+  /// Required when scope=tenant — the listing's owning tenant. Null
+  /// for platform-curated packages authored by Anthropic-side admins.
+  tenantId    String?
+  /// draft | review | approved | deprecated
+  status      String   @default("approved")
+  /// Denormalized counters refreshed on install/uninstall + review save.
+  installCount Int     @default(0)
+  /// 0..50 (5.0 stars * 10) — ratingAvg10 / 10 = stars.
+  ratingAvg10  Int     @default(0)
+  ratingCount  Int     @default(0)
+  /// Optional icon asset id (resolved via the asset router).
+  iconAssetId  String?
+  /// Array of asset ids for the screenshot gallery.
+  galleryJson  Json    @default("[]")
+  /// Free-form tag array used by the search filter.
+  tagsJson     Json    @default("[]")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  publisher MarketplacePublisher? @relation(fields: [publisherId], references: [id], onDelete: SetNull)
+  tenant    Tenant?               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  versions  MarketplacePackageVersion[]
+  installs  MarketplaceInstall[]
+  reviews   MarketplaceReview[]
+
+  @@index([scope, status])
+  @@index([kind])
+  @@index([tenantId])
+  @@index([publisherId])
+}
+
+/// A semver-tagged version of a package. The latest approved version
+/// is what new installs receive by default.
+model MarketplacePackageVersion {
+  id          String   @id @default(cuid())
+  packageId   String
+  /// Semver string. Must be unique per package.
+  version     String
+  changelog   String   @default("")
+  /// The actual payload — shape depends on package.kind:
+  ///   plugin       -> { manifest: {...}, code?: string }
+  ///   frame_pack   -> { assets: [{name, type, url, ...}] }
+  ///   cms_theme    -> { theme: {tokensJson, layoutJson, ...} }
+  ///   starter_kit  -> { project, cards, sets, ... }
+  ///   exporter     -> { manifest, code }
+  contentJson Json     @default("{}")
+  /// draft | review | approved
+  status      String   @default("approved")
+  publishedAt DateTime?
+  createdAt   DateTime @default(now())
+
+  package MarketplacePackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+
+  @@unique([packageId, version])
+  @@index([packageId])
+}
+
+/// One row per (tenant, package) install. We never delete install
+/// rows on uninstall — we flip `enabled` so re-installing keeps the
+/// previous version pin and any tenant-scoped settings.
+model MarketplaceInstall {
+  id          String   @id @default(cuid())
+  tenantId    String
+  packageId   String
+  /// Pinned version. Null = track-latest (auto-upgrade on next visit).
+  versionId   String?
+  enabled     Boolean  @default(true)
+  /// Tenant-scoped settings for this install — equivalent to
+  /// PluginInstall.settingsJson, but available for non-plugin kinds.
+  settingsJson Json    @default("{}")
+  installedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant  Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  package MarketplacePackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, packageId])
+  @@index([tenantId])
+  @@index([packageId])
+}
+
+/// User-authored review for a package. Scoped by tenant so the same
+/// human reviewing from two different tenants leaves two reviews.
+model MarketplaceReview {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  packageId String
+  /// 1..5 stars.
+  rating    Int
+  body      String   @default("")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  package MarketplacePackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+
+  @@unique([packageId, userId])
+  @@index([packageId])
+  @@index([tenantId])
+}
