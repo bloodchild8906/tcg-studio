@@ -43,10 +43,19 @@
  */
 
 import type { FastifyInstance, FastifyRequest } from "fastify";
+import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { requireUser } from "@/plugins/auth";
 import { writeAudit } from "@/lib/audit";
+
+const SALT_ROUNDS = 10;
+const TENANT_MEMBER_ROLES = [
+  "tenant_owner",
+  "tenant_admin",
+  "project_creator",
+  "viewer",
+] as const;
 
 const idParam = z.object({ id: z.string().min(1) });
 
@@ -927,4 +936,420 @@ export default async function platformRoutes(fastify: FastifyInstance) {
       return reply.code(201).send({ package: pkg });
     },
   );
+
+  // -------------------------------------------------------------------------
+  // Tenant user management (platform-admin scope).
+  //
+  // Platform owners/admins need a way to attach users to any tenant
+  // without needing to first add themselves to that tenant. These
+  // endpoints bypass the regular tenant-scope auth gate by sitting
+  // under /platform/tenants/:tenantId/... and being guarded by
+  // requirePlatformRole("admin"). They never trust a client-submitted
+  // tenant id from outside this path (sec 36.4) — the tenantId is a
+  // URL param.
+  //
+  //   GET    /api/v1/platform/tenants/:tenantId/members
+  //   POST   /api/v1/platform/tenants/:tenantId/members
+  //   PATCH  /api/v1/platform/tenants/:tenantId/members/:userId
+  //   DELETE /api/v1/platform/tenants/:tenantId/members/:userId
+  //   POST   /api/v1/platform/users/:userId/password
+  //   GET    /api/v1/platform/users?q=...
+  //
+  // The password endpoint is the "platform support resets a user's
+  // password" workflow. The new password is sent in the body — yes,
+  // over TLS — and never logged. We bcrypt-hash before write and
+  // emit an audit row so abuse is traceable.
+  // -------------------------------------------------------------------------
+
+  fastify.get(
+    "/api/v1/platform/tenants/:tenantId/members",
+    async (request, reply) => {
+      await requirePlatformRole(fastify, request, "support");
+      const { tenantId } = z
+        .object({ tenantId: z.string().min(1) })
+        .parse(request.params);
+      const tenant = await fastify.prisma.tenant.findUnique({
+        where: { id: tenantId },
+        select: { id: true, slug: true, name: true },
+      });
+      if (!tenant) return reply.code(404).send({ error: "tenant_not_found" });
+      const memberships = await fastify.prisma.membership.findMany({
+        where: { tenantId },
+        orderBy: { createdAt: "asc" },
+        select: {
+          id: true,
+          role: true,
+          createdAt: true,
+          user: {
+            select: {
+              id: true,
+              email: true,
+              name: true,
+              platformRole: true,
+              createdAt: true,
+            },
+          },
+        },
+      });
+      return { tenant, members: memberships };
+    },
+  );
+
+  fastify.post(
+    "/api/v1/platform/tenants/:tenantId/members",
+    async (request, reply) => {
+      const callerRole = await requirePlatformRole(fastify, request, "admin");
+      const caller = requireUser(request);
+      const { tenantId } = z
+        .object({ tenantId: z.string().min(1) })
+        .parse(request.params);
+      const body = z
+        .object({
+          email: z.string().email().max(180),
+          // Used to create the user if they don't exist yet.
+          name: z.string().min(1).max(120).optional(),
+          password: z.string().min(8).max(200).optional(),
+          role: z.enum(TENANT_MEMBER_ROLES).default("tenant_admin"),
+        })
+        .parse(request.body);
+
+      const tenant = await fastify.prisma.tenant.findUnique({
+        where: { id: tenantId },
+        select: { id: true },
+      });
+      if (!tenant) return reply.code(404).send({ error: "tenant_not_found" });
+
+      const email = body.email.toLowerCase().trim();
+      let user = await fastify.prisma.user.findUnique({
+        where: { email },
+        select: { id: true, email: true, name: true },
+      });
+      let created = false;
+      if (!user) {
+        // Auto-create the user. Platform admin is signing them up on
+        // the customer's behalf — they'll change their password on
+        // first login. Requires a password (we never invent one) so
+        // the credentials are explicit.
+        if (!body.password) {
+          return reply.code(400).send({
+            error: "password_required",
+            message:
+              "No user exists with that email. Provide a password to create one.",
+          });
+        }
+        const hash = await bcrypt.hash(body.password, SALT_ROUNDS);
+        user = await fastify.prisma.user.create({
+          data: {
+            email,
+            name: body.name?.trim() || email.split("@")[0],
+            passwordHash: hash,
+          },
+          select: { id: true, email: true, name: true },
+        });
+        created = true;
+      }
+
+      // Upsert the membership — if they're already in the tenant we
+      // just update the role rather than throw a 409 on the unique
+      // constraint.
+      const membership = await fastify.prisma.membership.upsert({
+        where: { tenantId_userId: { tenantId, userId: user.id } },
+        update: { role: body.role },
+        create: { tenantId, userId: user.id, role: body.role },
+        select: { id: true, role: true, createdAt: true },
+      });
+
+      await writeAudit(fastify.prisma, request, {
+        tenantId,
+        action: "platform.tenant.member.add",
+        actorUserId: caller.id,
+        actorRole: `platform:${callerRole}`,
+        entityType: "user",
+        entityId: user.id,
+        metadata: { email: user.email, role: body.role, created },
+      });
+
+      return reply
+        .code(created ? 201 : 200)
+        .send({ membership: { ...membership, user }, created });
+    },
+  );
+
+  fastify.patch(
+    "/api/v1/platform/tenants/:tenantId/members/:userId",
+    async (request, reply) => {
+      const callerRole = await requirePlatformRole(fastify, request, "admin");
+      const caller = requireUser(request);
+      const params = z
+        .object({ tenantId: z.string().min(1), userId: z.string().min(1) })
+        .parse(request.params);
+      const body = z
+        .object({ role: z.enum(TENANT_MEMBER_ROLES) })
+        .parse(request.body);
+
+      const existing = await fastify.prisma.membership.findUnique({
+        where: {
+          tenantId_userId: { tenantId: params.tenantId, userId: params.userId },
+        },
+        select: { id: true, role: true },
+      });
+      if (!existing) return reply.code(404).send({ error: "not_found" });
+
+      // Last-owner protection: refuse to demote the only remaining
+      // tenant_owner. Otherwise the tenant becomes unmanageable
+      // without platform intervention.
+      if (existing.role === "tenant_owner" && body.role !== "tenant_owner") {
+        const ownerCount = await fastify.prisma.membership.count({
+          where: { tenantId: params.tenantId, role: "tenant_owner" },
+        });
+        if (ownerCount <= 1) {
+          return reply.code(409).send({
+            error: "last_owner",
+            message:
+              "Can't demote the last tenant_owner. Promote another member to tenant_owner first.",
+          });
+        }
+      }
+
+      const updated = await fastify.prisma.membership.update({
+        where: { id: existing.id },
+        data: { role: body.role },
+        select: {
+          id: true,
+          role: true,
+          createdAt: true,
+          user: { select: { id: true, email: true, name: true } },
+        },
+      });
+
+      await writeAudit(fastify.prisma, request, {
+        tenantId: params.tenantId,
+        action: "platform.tenant.member.role",
+        actorUserId: caller.id,
+        actorRole: `platform:${callerRole}`,
+        entityType: "user",
+        entityId: params.userId,
+        metadata: { from: existing.role, to: body.role },
+      });
+
+      return reply.send({ membership: updated });
+    },
+  );
+
+  fastify.delete(
+    "/api/v1/platform/tenants/:tenantId/members/:userId",
+    async (request, reply) => {
+      const callerRole = await requirePlatformRole(fastify, request, "admin");
+      const caller = requireUser(request);
+      const params = z
+        .object({ tenantId: z.string().min(1), userId: z.string().min(1) })
+        .parse(request.params);
+
+      const existing = await fastify.prisma.membership.findUnique({
+        where: {
+          tenantId_userId: { tenantId: params.tenantId, userId: params.userId },
+        },
+        select: { id: true, role: true },
+      });
+      if (!existing) return reply.code(404).send({ error: "not_found" });
+
+      if (existing.role === "tenant_owner") {
+        const ownerCount = await fastify.prisma.membership.count({
+          where: { tenantId: params.tenantId, role: "tenant_owner" },
+        });
+        if (ownerCount <= 1) {
+          return reply.code(409).send({
+            error: "last_owner",
+            message:
+              "Can't remove the last tenant_owner. Promote another member to tenant_owner first.",
+          });
+        }
+      }
+
+      await fastify.prisma.membership.delete({ where: { id: existing.id } });
+
+      await writeAudit(fastify.prisma, request, {
+        tenantId: params.tenantId,
+        action: "platform.tenant.member.remove",
+        actorUserId: caller.id,
+        actorRole: `platform:${callerRole}`,
+        entityType: "user",
+        entityId: params.userId,
+        metadata: { previousRole: existing.role },
+      });
+
+      return reply.code(204).send();
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Cross-tenant user management. Platform admins can:
+  //   - search the global user directory
+  //   - reset (rotate) any user's password
+  //   - rename / update display details
+  //
+  // Privacy: only platform admins reach these — non-admins get a 403
+  // from requirePlatformRole. The audit row uses the actor's first
+  // available tenant for storage (audit rows require a tenantId).
+  // -------------------------------------------------------------------------
+
+  fastify.get("/api/v1/platform/users", async (request) => {
+    await requirePlatformRole(fastify, request, "support");
+    const q = z
+      .object({
+        q: z.string().max(120).optional(),
+        limit: z.coerce.number().int().min(1).max(200).default(50),
+      })
+      .parse((request.query as Record<string, unknown>) ?? {});
+
+    const where: Prisma.UserWhereInput = q.q
+      ? {
+          OR: [
+            { email: { contains: q.q.toLowerCase(), mode: "insensitive" } },
+            { name: { contains: q.q, mode: "insensitive" } },
+          ],
+        }
+      : {};
+
+    const users = await fastify.prisma.user.findMany({
+      where,
+      orderBy: { email: "asc" },
+      take: q.limit,
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        platformRole: true,
+        createdAt: true,
+        _count: { select: { memberships: true } },
+      },
+    });
+    return { users };
+  });
+
+  fastify.post(
+    "/api/v1/platform/users/:userId/password",
+    async (request, reply) => {
+      const callerRole = await requirePlatformRole(fastify, request, "admin");
+      const caller = requireUser(request);
+      const { userId } = z
+        .object({ userId: z.string().min(1) })
+        .parse(request.params);
+      const body = z
+        .object({ password: z.string().min(8).max(200) })
+        .parse(request.body);
+
+      const target = await fastify.prisma.user.findUnique({
+        where: { id: userId },
+        select: { id: true, email: true, platformRole: true },
+      });
+      if (!target) return reply.code(404).send({ error: "not_found" });
+
+      // Only owners can rotate another owner's password. Admins
+      // changing an owner's password would undermine the owner-only
+      // promotion ladder.
+      if (target.platformRole === "owner" && callerRole !== "owner") {
+        return reply.code(403).send({
+          error: "owner_only",
+          message:
+            "Only platform owners can rotate another owner's password.",
+        });
+      }
+
+      const hash = await bcrypt.hash(body.password, SALT_ROUNDS);
+      await fastify.prisma.user.update({
+        where: { id: userId },
+        data: { passwordHash: hash },
+      });
+
+      const callerTenant = await fastify.prisma.membership.findFirst({
+        where: { userId: caller.id },
+        select: { tenantId: true },
+      });
+      if (callerTenant) {
+        await writeAudit(fastify.prisma, request, {
+          tenantId: callerTenant.tenantId,
+          action: "platform.user.password_reset",
+          actorUserId: caller.id,
+          actorRole: `platform:${callerRole}`,
+          entityType: "user",
+          entityId: target.id,
+          // Never log the new password. Just the fact of the rotation.
+          metadata: { email: target.email },
+        });
+      }
+
+      return reply.code(204).send();
+    },
+  );
+
+  fastify.patch("/api/v1/platform/users/:userId", async (request, reply) => {
+    const callerRole = await requirePlatformRole(fastify, request, "admin");
+    const caller = requireUser(request);
+    const { userId } = z
+      .object({ userId: z.string().min(1) })
+      .parse(request.params);
+    const body = z
+      .object({
+        name: z.string().min(1).max(120).optional(),
+        email: z.string().email().max(180).optional(),
+      })
+      .parse(request.body);
+
+    const target = await fastify.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, platformRole: true, email: true },
+    });
+    if (!target) return reply.code(404).send({ error: "not_found" });
+    if (target.platformRole === "owner" && callerRole !== "owner") {
+      return reply.code(403).send({
+        error: "owner_only",
+        message:
+          "Only platform owners can edit another owner's profile.",
+      });
+    }
+
+    if (body.email && body.email.toLowerCase() !== target.email) {
+      const dupe = await fastify.prisma.user.findUnique({
+        where: { email: body.email.toLowerCase() },
+        select: { id: true },
+      });
+      if (dupe) {
+        return reply.code(409).send({ error: "email_taken" });
+      }
+    }
+
+    const updated = await fastify.prisma.user.update({
+      where: { id: userId },
+      data: {
+        ...(body.name !== undefined ? { name: body.name } : {}),
+        ...(body.email !== undefined ? { email: body.email.toLowerCase() } : {}),
+      },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        platformRole: true,
+        createdAt: true,
+      },
+    });
+
+    const callerTenant = await fastify.prisma.membership.findFirst({
+      where: { userId: caller.id },
+      select: { tenantId: true },
+    });
+    if (callerTenant) {
+      await writeAudit(fastify.prisma, request, {
+        tenantId: callerTenant.tenantId,
+        action: "platform.user.update",
+        actorUserId: caller.id,
+        actorRole: `platform:${callerRole}`,
+        entityType: "user",
+        entityId: target.id,
+        metadata: { changed: Object.keys(body) },
+      });
+    }
+
+    return reply.send({ user: updated });
+  });
 }

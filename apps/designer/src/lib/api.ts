@@ -440,6 +440,14 @@ export async function createTenant(input: {
   /** White-label tokens captured by the registration wizard.
    *  Used by the backend to seed the default CMS landing/login. */
   brandingJson?: Record<string, unknown>;
+  /** Owner-on-create fields. When the caller is a platform admin and
+   *  supplies an ownerEmail, the user is created (if needed) or
+   *  attached (if existing) as the new tenant's first member. The
+   *  calling admin is NOT auto-attached in that case. */
+  ownerEmail?: string;
+  ownerName?: string;
+  ownerPassword?: string;
+  ownerRole?: "tenant_owner" | "tenant_admin" | "project_creator" | "viewer";
 }): Promise<Tenant> {
   const r = await request<{ tenant: Tenant }>("/api/v1/tenants", {
     method: "POST",
@@ -3550,6 +3558,121 @@ export async function updatePlatformTenant(
     { method: "PATCH", body: patch },
   );
   return r.tenant;
+}
+
+// ---------------------------------------------------------------------------
+// Platform-scope tenant membership + user management.
+// ---------------------------------------------------------------------------
+
+export type TenantMemberRole =
+  | "tenant_owner"
+  | "tenant_admin"
+  | "project_creator"
+  | "viewer";
+
+export interface PlatformTenantMember {
+  id: string;
+  role: TenantMemberRole;
+  createdAt: string;
+  user: {
+    id: string;
+    email: string;
+    name: string;
+    platformRole: "owner" | "admin" | "support" | null;
+    createdAt: string;
+  };
+}
+
+export interface PlatformUserRow {
+  id: string;
+  email: string;
+  name: string;
+  platformRole: "owner" | "admin" | "support" | null;
+  createdAt: string;
+  _count: { memberships: number };
+}
+
+export async function listPlatformTenantMembers(
+  tenantId: string,
+): Promise<{
+  tenant: { id: string; slug: string; name: string };
+  members: PlatformTenantMember[];
+}> {
+  return request(
+    `/api/v1/platform/tenants/${encodeURIComponent(tenantId)}/members`,
+  );
+}
+
+/** Attach a user to a tenant. If the email doesn't exist yet, supply
+ *  a password (and optionally a name) and the user will be created in
+ *  the same operation. Otherwise the existing user is added. */
+export async function addPlatformTenantMember(
+  tenantId: string,
+  input: {
+    email: string;
+    name?: string;
+    password?: string;
+    role?: TenantMemberRole;
+  },
+): Promise<PlatformTenantMember> {
+  const r = await request<{ membership: PlatformTenantMember; created: boolean }>(
+    `/api/v1/platform/tenants/${encodeURIComponent(tenantId)}/members`,
+    { method: "POST", body: input },
+  );
+  return r.membership;
+}
+
+export async function updatePlatformTenantMember(
+  tenantId: string,
+  userId: string,
+  patch: { role: TenantMemberRole },
+): Promise<PlatformTenantMember> {
+  const r = await request<{ membership: PlatformTenantMember }>(
+    `/api/v1/platform/tenants/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}`,
+    { method: "PATCH", body: patch },
+  );
+  return r.membership;
+}
+
+export async function removePlatformTenantMember(
+  tenantId: string,
+  userId: string,
+): Promise<void> {
+  await request<void>(
+    `/api/v1/platform/tenants/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(userId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export async function searchPlatformUsers(
+  q?: string,
+): Promise<PlatformUserRow[]> {
+  const r = await request<{ users: PlatformUserRow[] }>(
+    "/api/v1/platform/users",
+    q ? { query: { q } } : undefined,
+  );
+  return r.users;
+}
+
+export async function resetPlatformUserPassword(
+  userId: string,
+  password: string,
+): Promise<void> {
+  await request<void>(
+    `/api/v1/platform/users/${encodeURIComponent(userId)}/password`,
+    { method: "POST", body: { password } },
+  );
+}
+
+export async function updatePlatformUser(
+  userId: string,
+  patch: { name?: string; email?: string },
+): Promise<PlatformUserRow> {
+  const r = await request<{ user: PlatformUserRow }>(
+    `/api/v1/platform/users/${encodeURIComponent(userId)}`,
+    { method: "PATCH", body: patch },
+  );
+  return r.user;
 }
 
 export async function fetchPlatformBillingSummary(): Promise<PlatformBillingSummary> {

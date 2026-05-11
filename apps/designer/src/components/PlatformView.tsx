@@ -71,6 +71,9 @@ function TenantsTab() {
   const [rows, setRows] = useState<api.PlatformTenantRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  // When set, opens the per-tenant Manage users modal.
+  const [managingMembersOf, setManagingMembersOf] =
+    useState<api.PlatformTenantRow | null>(null);
 
   async function refresh() {
     try {
@@ -204,6 +207,13 @@ function TenantsTab() {
                 </td>
                 <td className="px-3 py-2 text-right">
                   <div className="flex justify-end gap-1">
+                    <button
+                      type="button"
+                      onClick={() => setManagingMembersOf(t)}
+                      className="rounded border border-ink-700 bg-ink-800 px-2 py-0.5 text-[10px] text-ink-200 hover:bg-ink-700"
+                    >
+                      Manage users
+                    </button>
                     {t.status !== "suspended" && (
                       <button
                         type="button"
@@ -229,6 +239,12 @@ function TenantsTab() {
           </tbody>
         </table>
       </div>
+      {managingMembersOf && (
+        <ManageUsersModal
+          tenant={managingMembersOf}
+          onClose={() => setManagingMembersOf(null)}
+        />
+      )}
     </section>
   );
 }
@@ -1075,6 +1091,16 @@ function CreateTenantModal({
   const [tenantType, setTenantType] = useState<
     "studio" | "solo" | "publisher" | "school" | "reseller"
   >("studio");
+  // First-owner fields. The platform admin is creating a tenant on
+  // behalf of a customer; without an owner the tenant ships with no
+  // members and nobody can sign in. We require an email + name +
+  // password so the operator has explicit credentials to hand over.
+  // (If the email already exists, the password is optional — it
+  // rotates the existing user's password when supplied.)
+  const [ownerEmail, setOwnerEmail] = useState("");
+  const [ownerName, setOwnerName] = useState("");
+  const [ownerPassword, setOwnerPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Track whether the operator typed into the slug field directly. If
@@ -1092,6 +1118,20 @@ function CreateTenantModal({
       .slice(0, 40);
   }
 
+  /** Generate a 16-char password the operator can hand to the customer.
+   *  Avoids ambiguous glyphs (0/O/1/l/I) so it's easy to read off a
+   *  screen. The "Generate" button below the password field fills this
+   *  in for the operator. */
+  function suggestPassword(): string {
+    const alphabet =
+      "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*";
+    let out = "";
+    const buf = new Uint32Array(16);
+    crypto.getRandomValues(buf);
+    for (let i = 0; i < 16; i++) out += alphabet[buf[i] % alphabet.length];
+    return out;
+  }
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
@@ -1101,6 +1141,14 @@ function CreateTenantModal({
         name: name.trim(),
         slug: slug.trim() || autoSlug(name),
         tenantType,
+        ...(ownerEmail.trim()
+          ? {
+              ownerEmail: ownerEmail.trim(),
+              ownerName: ownerName.trim() || undefined,
+              ownerPassword: ownerPassword || undefined,
+              ownerRole: "tenant_owner" as const,
+            }
+          : {}),
       });
       onCreated();
     } catch (err) {
@@ -1119,14 +1167,14 @@ function CreateTenantModal({
     >
       <form
         onSubmit={submit}
-        className="w-[480px] rounded-xl border border-ink-700 bg-ink-900 p-6 shadow-2xl"
+        className="max-h-[90vh] w-[520px] overflow-y-auto rounded-xl border border-ink-700 bg-ink-900 p-6 shadow-2xl"
       >
         <div className="mb-5 flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold text-ink-50">Create tenant</h2>
             <p className="text-[11px] text-ink-500">
-              Mints a new workspace and seeds its default CMS site, landing, and
-              login pages.
+              Mints a new workspace, seeds its default CMS site + landing +
+              login pages, and assigns the specified user as tenant_owner.
             </p>
           </div>
           <button
@@ -1191,13 +1239,86 @@ function CreateTenantModal({
           </select>
         </Field>
 
+        <div className="mt-4 rounded border border-ink-800 bg-ink-950 p-3">
+          <h3 className="mb-1 text-xs font-medium uppercase tracking-wider text-ink-400">
+            Tenant owner
+          </h3>
+          <p className="mb-3 text-[11px] text-ink-500">
+            The user assigned as <code>tenant_owner</code> on creation.
+            If the email exists, they're attached. Otherwise a new user is
+            created with the password below — hand the credentials to the
+            customer. Leave blank to mint a tenant with no members (you can
+            attach users afterwards from <em>Manage users</em>).
+          </p>
+
+          <Field label="Owner email">
+            <input
+              type="email"
+              value={ownerEmail}
+              onChange={(e) => setOwnerEmail(e.target.value)}
+              placeholder="owner@acme.com"
+              className="block w-full rounded border border-ink-700 bg-ink-800 px-2.5 py-2 text-sm text-ink-100 placeholder:text-ink-500 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40"
+            />
+          </Field>
+
+          {ownerEmail.trim() && (
+            <>
+              <Field
+                label="Owner display name"
+                hint="Optional. Defaults to the email's local part."
+              >
+                <input
+                  type="text"
+                  value={ownerName}
+                  onChange={(e) => setOwnerName(e.target.value)}
+                  placeholder="Jane Doe"
+                  className="block w-full rounded border border-ink-700 bg-ink-800 px-2.5 py-2 text-sm text-ink-100 placeholder:text-ink-500 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40"
+                />
+              </Field>
+
+              <Field
+                label="Owner password"
+                hint="Required if creating a new user. Rotates the password if the email already exists."
+              >
+                <div className="flex gap-1">
+                  <input
+                    type={showPassword ? "text" : "password"}
+                    value={ownerPassword}
+                    onChange={(e) => setOwnerPassword(e.target.value)}
+                    placeholder="At least 8 characters"
+                    minLength={8}
+                    className="block flex-1 rounded border border-ink-700 bg-ink-800 px-2.5 py-2 font-mono text-sm text-ink-100 placeholder:text-ink-500 focus:border-accent-500/60 focus:ring-1 focus:ring-accent-500/40"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    className="rounded border border-ink-700 bg-ink-800 px-2 text-[10px] text-ink-300 hover:bg-ink-700"
+                  >
+                    {showPassword ? "Hide" : "Show"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOwnerPassword(suggestPassword());
+                      setShowPassword(true);
+                    }}
+                    className="rounded border border-accent-500/40 bg-accent-500/15 px-2 text-[10px] text-accent-300 hover:bg-accent-500/25"
+                  >
+                    Generate
+                  </button>
+                </div>
+              </Field>
+            </>
+          )}
+        </div>
+
         {error && (
-          <p className="mb-3 rounded border border-danger-500/30 bg-danger-500/10 px-2 py-1.5 text-xs text-danger-400">
+          <p className="mt-3 mb-1 rounded border border-danger-500/30 bg-danger-500/10 px-2 py-1.5 text-xs text-danger-400">
             {error}
           </p>
         )}
 
-        <div className="mt-2 flex justify-end gap-2">
+        <div className="mt-4 flex justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
@@ -1214,6 +1335,300 @@ function CreateTenantModal({
           </button>
         </div>
       </form>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Manage users — per-tenant member CRUD + password reset                 */
+/* ---------------------------------------------------------------------- */
+
+/**
+ * Modal that lists the members of a tenant and lets platform admins:
+ *   • Add a user (existing or auto-create with a password)
+ *   • Change a member's role
+ *   • Remove a member
+ *   • Reset any user's password (rotates their bcrypt hash)
+ *
+ * All endpoints sit under /api/v1/platform/... and are gated by
+ * platformRole >= "admin" on the backend. The last-tenant_owner
+ * protection is enforced server-side so we don't need to replicate
+ * it here, but we surface its 409 in the error state.
+ */
+function ManageUsersModal({
+  tenant,
+  onClose,
+}: {
+  tenant: api.PlatformTenantRow;
+  onClose: () => void;
+}) {
+  const [members, setMembers] = useState<api.PlatformTenantMember[] | null>(
+    null,
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  // Add-member form state
+  const [addEmail, setAddEmail] = useState("");
+  const [addName, setAddName] = useState("");
+  const [addPassword, setAddPassword] = useState("");
+  const [addRole, setAddRole] =
+    useState<api.TenantMemberRole>("tenant_admin");
+  const [addBusy, setAddBusy] = useState(false);
+
+  async function refresh() {
+    try {
+      const r = await api.listPlatformTenantMembers(tenant.id);
+      setMembers(r.members);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "load failed");
+    }
+  }
+
+  useEffect(() => {
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function handleAdd(e: React.FormEvent) {
+    e.preventDefault();
+    setAddBusy(true);
+    setError(null);
+    try {
+      await api.addPlatformTenantMember(tenant.id, {
+        email: addEmail.trim(),
+        name: addName.trim() || undefined,
+        password: addPassword || undefined,
+        role: addRole,
+      });
+      setAddEmail("");
+      setAddName("");
+      setAddPassword("");
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "add failed");
+    } finally {
+      setAddBusy(false);
+    }
+  }
+
+  async function setRole(m: api.PlatformTenantMember, role: api.TenantMemberRole) {
+    if (m.role === role) return;
+    setError(null);
+    try {
+      await api.updatePlatformTenantMember(tenant.id, m.user.id, { role });
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "update failed");
+    }
+  }
+
+  async function remove(m: api.PlatformTenantMember) {
+    if (!confirm(`Remove ${m.user.email} from ${tenant.name}?`)) return;
+    setError(null);
+    try {
+      await api.removePlatformTenantMember(tenant.id, m.user.id);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "remove failed");
+    }
+  }
+
+  async function resetPassword(m: api.PlatformTenantMember) {
+    const next = window.prompt(
+      `New password for ${m.user.email} (min 8 chars). The user keeps their email; only the password rotates.`,
+      "",
+    );
+    if (!next) return;
+    if (next.length < 8) {
+      setError("Password must be at least 8 characters.");
+      return;
+    }
+    try {
+      await api.resetPlatformUserPassword(m.user.id, next);
+      alert("Password rotated. Hand the new password to the user out-of-band.");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "reset failed");
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-ink-950/80 p-6 backdrop-blur"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="flex max-h-[90vh] w-[680px] flex-col overflow-hidden rounded-xl border border-ink-700 bg-ink-900 shadow-2xl">
+        <header className="flex items-center justify-between border-b border-ink-800 px-6 py-4">
+          <div>
+            <h2 className="text-lg font-semibold text-ink-50">Manage users</h2>
+            <p className="text-[11px] text-ink-500">
+              {tenant.name}{" "}
+              <span className="font-mono text-ink-600">({tenant.slug})</span>
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded p-1 text-ink-500 hover:bg-ink-800 hover:text-ink-100"
+          >
+            ×
+          </button>
+        </header>
+
+        <div className="flex-1 overflow-y-auto p-6">
+          {error && (
+            <p className="mb-3 rounded border border-danger-500/30 bg-danger-500/10 px-2 py-1.5 text-xs text-danger-400">
+              {error}
+            </p>
+          )}
+
+          <form
+            onSubmit={handleAdd}
+            className="mb-6 space-y-2 rounded border border-accent-500/30 bg-accent-500/5 p-3"
+          >
+            <h3 className="text-xs font-medium uppercase tracking-wider text-accent-300">
+              Add a user
+            </h3>
+            <p className="text-[11px] text-ink-500">
+              Existing email → user is attached. Unknown email → user is
+              created with the password below.
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                type="email"
+                value={addEmail}
+                onChange={(e) => setAddEmail(e.target.value)}
+                required
+                placeholder="user@example.com"
+                className="rounded border border-ink-700 bg-ink-800 px-2 py-1.5 text-xs text-ink-100"
+              />
+              <select
+                value={addRole}
+                onChange={(e) =>
+                  setAddRole(e.target.value as api.TenantMemberRole)
+                }
+                className="rounded border border-ink-700 bg-ink-800 px-2 py-1.5 text-xs text-ink-100"
+              >
+                <option value="tenant_owner">tenant_owner</option>
+                <option value="tenant_admin">tenant_admin</option>
+                <option value="project_creator">project_creator</option>
+                <option value="viewer">viewer</option>
+              </select>
+              <input
+                type="text"
+                value={addName}
+                onChange={(e) => setAddName(e.target.value)}
+                placeholder="Display name (optional)"
+                className="rounded border border-ink-700 bg-ink-800 px-2 py-1.5 text-xs text-ink-100"
+              />
+              <input
+                type="password"
+                value={addPassword}
+                onChange={(e) => setAddPassword(e.target.value)}
+                placeholder="Password (required if new user)"
+                minLength={8}
+                className="rounded border border-ink-700 bg-ink-800 px-2 py-1.5 font-mono text-xs text-ink-100"
+              />
+            </div>
+            <div className="flex justify-end">
+              <button
+                type="submit"
+                disabled={addBusy || !addEmail.trim()}
+                className="rounded-md bg-accent-500 px-3 py-1.5 text-xs font-semibold text-ink-950 hover:bg-accent-400 disabled:opacity-50"
+              >
+                {addBusy ? "Adding…" : "Add user"}
+              </button>
+            </div>
+          </form>
+
+          {!members ? (
+            <p className="text-sm text-ink-500">Loading…</p>
+          ) : members.length === 0 ? (
+            <p className="text-sm text-ink-500">
+              No members yet. Use the form above to attach the first user.
+            </p>
+          ) : (
+            <div className="overflow-hidden rounded border border-ink-800">
+              <table className="w-full text-xs">
+                <thead className="bg-ink-900 text-[10px] uppercase tracking-wider text-ink-500">
+                  <tr>
+                    <th className="px-3 py-2 text-left">User</th>
+                    <th className="px-3 py-2 text-left">Role</th>
+                    <th className="px-3 py-2 text-left">Joined</th>
+                    <th className="px-3 py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-ink-800">
+                  {members.map((m) => (
+                    <tr key={m.id} className="bg-ink-950 text-ink-200">
+                      <td className="px-3 py-2">
+                        <div className="font-medium text-ink-100">
+                          {m.user.name || m.user.email}
+                        </div>
+                        <div className="font-mono text-[10px] text-ink-500">
+                          {m.user.email}
+                        </div>
+                        {m.user.platformRole && (
+                          <div className="mt-0.5 inline-block rounded bg-accent-500/15 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-accent-300">
+                            platform:{m.user.platformRole}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        <select
+                          value={m.role}
+                          onChange={(e) =>
+                            setRole(m, e.target.value as api.TenantMemberRole)
+                          }
+                          className="rounded border border-ink-700 bg-ink-800 px-1.5 py-0.5 text-[11px] text-ink-100"
+                        >
+                          <option value="tenant_owner">tenant_owner</option>
+                          <option value="tenant_admin">tenant_admin</option>
+                          <option value="project_creator">project_creator</option>
+                          <option value="viewer">viewer</option>
+                        </select>
+                      </td>
+                      <td className="px-3 py-2 text-[10px] text-ink-500">
+                        {new Date(m.createdAt).toLocaleDateString()}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <div className="flex justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => void resetPassword(m)}
+                            className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300 hover:bg-amber-500/20"
+                          >
+                            Reset password
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void remove(m)}
+                            className="rounded border border-danger-500/30 bg-danger-500/10 px-2 py-0.5 text-[10px] text-danger-400 hover:bg-danger-500/20"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+
+        <footer className="border-t border-ink-800 px-6 py-3 text-right">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded border border-ink-700 bg-ink-800 px-3 py-1.5 text-xs text-ink-200 hover:bg-ink-700"
+          >
+            Close
+          </button>
+        </footer>
+      </div>
     </div>
   );
 }
