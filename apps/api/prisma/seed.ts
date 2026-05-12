@@ -15,7 +15,8 @@
  *      so they can edit its CMS pages.
  *   4. The default CMS scaffolding (studio site + `home` + `__login` pages)
  *      via the same helper the tenant-create route uses.
- *   5. A default user-facing tenant (for demo / local dev purposes).
+ *   5. A default user-facing tenant (for demo / local dev purposes), with
+ *      optional customizable tenant owner (via env or interactive prompt).
  *
  * No demo project, card type, or template. The admin builds real tenants
  * for end-users from the UI after first login; this seed only stands up
@@ -25,6 +26,12 @@
  *
  * Run from the API container:
  *     docker compose exec api npm run seed
+ *
+ * Or with explicit default tenant owner:
+ *     docker compose exec api \
+ *       DEFAULT_TENANT_OWNER_EMAIL=alice@example.com \
+ *       DEFAULT_TENANT_OWNER_NAME="Alice Smith" \
+ *       npm run seed
  */
 
 import { PrismaClient } from "@prisma/client";
@@ -32,6 +39,12 @@ import bcrypt from "bcryptjs";
 import { ensureDefaultCmsContent } from "../src/lib/cmsDefaults";
 
 const prisma = new PrismaClient();
+
+// Node.js readline for interactive prompts (if running in terminal mode)
+const readline = require("readline").createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
 
 /**
  * Platform admin credentials. Override via env to keep secrets out of git:
@@ -64,6 +77,39 @@ const SEED_DEFAULT_TENANT = process.env.SEED_DEFAULT_TENANT !== "false";
 const DEFAULT_TENANT_SLUG = process.env.DEFAULT_TENANT_SLUG ?? "default";
 const DEFAULT_TENANT_NAME =
   process.env.DEFAULT_TENANT_NAME ?? "Demo Game Studio";
+
+/**
+ * Default tenant owner configuration. When seeding the default tenant,
+ * these values determine who gets tenant_owner access.
+ *
+ * Priority:
+ *   1. Explicit env vars (DEFAULT_TENANT_OWNER_EMAIL, etc.)
+ *   2. Interactive prompt (if in a terminal)
+ *   3. Use the platform admin as the owner (fallback)
+ */
+const DEFAULT_TENANT_OWNER_EMAIL =
+  process.env.DEFAULT_TENANT_OWNER_EMAIL?.toLowerCase().trim() || null;
+const DEFAULT_TENANT_OWNER_NAME =
+  process.env.DEFAULT_TENANT_OWNER_NAME?.trim() || null;
+const DEFAULT_TENANT_OWNER_PASSWORD = process.env.DEFAULT_TENANT_OWNER_PASSWORD || null;
+
+const SALT_ROUNDS = 10;
+
+/**
+ * Prompt the user for input in the terminal. Returns immediately if not a TTY.
+ */
+function prompt(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    // If not a TTY (e.g., running in CI), return empty string immediately.
+    if (!process.stdin.isTTY) {
+      resolve("");
+      return;
+    }
+    readline.question(question, (answer: string) => {
+      resolve(answer.trim());
+    });
+  });
+}
 
 async function main() {
   // bcrypt-hash on every run so a stale hash from an earlier rev doesn't
@@ -141,10 +187,10 @@ async function main() {
 
   // ── Default user-facing tenant (dev/demo) ──────────────────────────
   // When SEED_DEFAULT_TENANT is true (dev/local default), creates a
-  // demo tenant with the admin as tenant_owner. Useful for quick iterations
-  // without the UI tenant-creation flow. In production, set
+  // demo tenant with a configurable owner. In production, set
   // SEED_DEFAULT_TENANT=false to skip this.
   let defaultTenant = null;
+  let defaultTenantOwnerUser = null;
   if (SEED_DEFAULT_TENANT) {
     defaultTenant = await prisma.tenant.upsert({
       where: { slug: DEFAULT_TENANT_SLUG },
@@ -156,21 +202,100 @@ async function main() {
       },
     });
 
-    // Grant admin tenant_owner access to the default tenant
-    await prisma.membership.upsert({
-      where: {
-        tenantId_userId: {
+    // Resolve the default tenant owner — ask the user if not provided
+    // via environment variables.
+    let ownerEmail = DEFAULT_TENANT_OWNER_EMAIL;
+    let ownerName = DEFAULT_TENANT_OWNER_NAME;
+    let ownerPassword = DEFAULT_TENANT_OWNER_PASSWORD;
+
+    if (!ownerEmail) {
+      // Interactive mode — prompt for tenant owner details.
+      // (Only if running in a TTY; otherwise use the platform admin as fallback.)
+      if (process.stdin.isTTY) {
+        // eslint-disable-next-line no-console
+        console.log("\n─── Default Tenant Owner ───");
+        // eslint-disable-next-line no-console
+        console.log(
+          "Assign the default tenant's first owner. Press Enter to use the platform admin.",
+        );
+
+        ownerEmail = await prompt("Owner email: ");
+        if (ownerEmail) {
+          ownerName = await prompt("Owner name: ");
+          ownerPassword = await prompt("Owner password (min 8 chars): ");
+
+          // Validate password length
+          while (ownerPassword && ownerPassword.length < 8) {
+            // eslint-disable-next-line no-console
+            console.log("❌ Password must be at least 8 characters.");
+            ownerPassword = await prompt("Owner password (min 8 chars): ");
+          }
+        }
+      }
+    }
+
+    // Create or update the tenant owner user.
+    if (ownerEmail) {
+      const normalizedOwnerEmail = ownerEmail.toLowerCase().trim();
+      try {
+        const ownerPasswordHash = ownerPassword
+          ? await bcrypt.hash(ownerPassword, SALT_ROUNDS)
+          : undefined;
+
+        defaultTenantOwnerUser = await prisma.user.upsert({
+          where: { email: normalizedOwnerEmail },
+          update: {
+            name: ownerName || normalizedOwnerEmail.split("@")[0],
+            ...(ownerPasswordHash ? { passwordHash: ownerPasswordHash } : {}),
+          },
+          create: {
+            email: normalizedOwnerEmail,
+            name: ownerName || normalizedOwnerEmail.split("@")[0],
+            passwordHash: ownerPasswordHash || null,
+          },
+          select: { id: true, email: true, name: true },
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `⚠️  Could not create/update tenant owner user: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // Grant owner access to the default tenant.
+    if (defaultTenantOwnerUser) {
+      await prisma.membership.upsert({
+        where: {
+          tenantId_userId: {
+            tenantId: defaultTenant.id,
+            userId: defaultTenantOwnerUser.id,
+          },
+        },
+        update: { role: "tenant_owner" },
+        create: {
+          tenantId: defaultTenant.id,
+          userId: defaultTenantOwnerUser.id,
+          role: "tenant_owner",
+        },
+      });
+    } else {
+      // Fallback: use the platform admin as the tenant owner.
+      await prisma.membership.upsert({
+        where: {
+          tenantId_userId: {
+            tenantId: defaultTenant.id,
+            userId: user.id,
+          },
+        },
+        update: { role: "tenant_owner" },
+        create: {
           tenantId: defaultTenant.id,
           userId: user.id,
+          role: "tenant_owner",
         },
-      },
-      update: { role: "tenant_owner" },
-      create: {
-        tenantId: defaultTenant.id,
-        userId: user.id,
-        role: "tenant_owner",
-      },
-    });
+      });
+    }
   }
 
   // ── Cleanup of legacy demo data from earlier seed revs ─────────────
@@ -207,27 +332,33 @@ async function main() {
     await prisma.tenant.deleteMany({ where: { slug: DEFAULT_TENANT_SLUG } });
   }
 
+  // ── Output summary ──────────────────────────────────────────────────
   // eslint-disable-next-line no-console
   console.log(
     [
-      "seeded:",
-      `  user           = ${user.email} (platform owner)`,
-      `  platformTenant = ${platformTenant.slug}`,
-      `  cms.site       = ${cmsResult.siteId}`,
-      `  cms.pages      = home:${cmsResult.created.home ? "new" : "kept"}, __login:${cmsResult.created.login ? "new" : "kept"}, __members:${cmsResult.created.members ? "new" : "kept"}`,
+      "\n✅ Seeded:",
+      `  platform admin     = ${user.email} (platformRole: owner)`,
+      `  platform tenant    = ${platformTenant.slug}`,
+      `  cms.site           = ${cmsResult.siteId}`,
+      `  cms.pages          = home:${cmsResult.created.home ? "new" : "kept"}, __login:${cmsResult.created.login ? "new" : "kept"}, __members:${cmsResult.created.members ? "new" : "kept"}`,
       ...(defaultTenant
         ? [
-            `  defaultTenant  = ${defaultTenant.slug} (${DEFAULT_TENANT_NAME})`,
+            `  default tenant     = ${defaultTenant.slug} (${DEFAULT_TENANT_NAME})`,
+            `  tenant owner       = ${defaultTenantOwnerUser ? `${defaultTenantOwnerUser.email} (${defaultTenantOwnerUser.name})` : user.email + " (platform admin)"}`,
           ]
         : []),
+      "",
     ].join("\n"),
   );
+
+  readline.close();
 }
 
 main()
   .catch((err) => {
     // eslint-disable-next-line no-console
     console.error(err);
+    readline.close();
     process.exit(1);
   })
   .finally(async () => {
