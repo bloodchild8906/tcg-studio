@@ -15,6 +15,7 @@
  *      so they can edit its CMS pages.
  *   4. The default CMS scaffolding (studio site + `home` + `__login` pages)
  *      via the same helper the tenant-create route uses.
+ *   5. A default user-facing tenant (for demo / local dev purposes).
  *
  * No demo project, card type, or template. The admin builds real tenants
  * for end-users from the UI after first login; this seed only stands up
@@ -53,6 +54,16 @@ const SEED_ADMIN_NAME = process.env.SEED_ADMIN_NAME ?? "Michael";
 const PLATFORM_TENANT_SLUG = process.env.PLATFORM_TENANT_SLUG ?? "platform";
 const PLATFORM_TENANT_NAME =
   process.env.PLATFORM_TENANT_NAME ?? "TCGStudio";
+
+/**
+ * Default user-facing tenant. When SEED_DEFAULT_TENANT is true (default in dev),
+ * a demo tenant is created for quick prototyping. Disable by setting the env
+ * var to "false" in production.
+ */
+const SEED_DEFAULT_TENANT = process.env.SEED_DEFAULT_TENANT !== "false";
+const DEFAULT_TENANT_SLUG = process.env.DEFAULT_TENANT_SLUG ?? "default";
+const DEFAULT_TENANT_NAME =
+  process.env.DEFAULT_TENANT_NAME ?? "Demo Game Studio";
 
 async function main() {
   // bcrypt-hash on every run so a stale hash from an earlier rev doesn't
@@ -128,6 +139,40 @@ async function main() {
     },
   );
 
+  // ── Default user-facing tenant (dev/demo) ──────────────────────────
+  // When SEED_DEFAULT_TENANT is true (dev/local default), creates a
+  // demo tenant with the admin as tenant_owner. Useful for quick iterations
+  // without the UI tenant-creation flow. In production, set
+  // SEED_DEFAULT_TENANT=false to skip this.
+  let defaultTenant = null;
+  if (SEED_DEFAULT_TENANT) {
+    defaultTenant = await prisma.tenant.upsert({
+      where: { slug: DEFAULT_TENANT_SLUG },
+      update: { name: DEFAULT_TENANT_NAME },
+      create: {
+        slug: DEFAULT_TENANT_SLUG,
+        name: DEFAULT_TENANT_NAME,
+        tenantType: "studio", // Indie Studio archetype (sec 8)
+      },
+    });
+
+    // Grant admin tenant_owner access to the default tenant
+    await prisma.membership.upsert({
+      where: {
+        tenantId_userId: {
+          tenantId: defaultTenant.id,
+          userId: user.id,
+        },
+      },
+      update: { role: "tenant_owner" },
+      create: {
+        tenantId: defaultTenant.id,
+        userId: user.id,
+        role: "tenant_owner",
+      },
+    });
+  }
+
   // ── Cleanup of legacy demo data from earlier seed revs ─────────────
   await prisma.template.deleteMany({
     where: { id: "tpl_character_sample_seed" },
@@ -144,10 +189,23 @@ async function main() {
   await prisma.tenant.deleteMany({ where: { slug: "demo" } });
   // Also drop the placeholder "studio" tenant created by older seed revs —
   // real tenants are user-facing and should be created from the UI.
-  await prisma.membership.deleteMany({
-    where: { tenant: { slug: "studio" } },
-  });
-  await prisma.tenant.deleteMany({ where: { slug: "studio" } });
+  // (But only if we're not seeding a default tenant with that name.)
+  if (!SEED_DEFAULT_TENANT) {
+    await prisma.membership.deleteMany({
+      where: { tenant: { slug: "studio" } },
+    });
+    await prisma.tenant.deleteMany({ where: { slug: "studio" } });
+  }
+
+  // ── Cleanup completed default tenant if SEED_DEFAULT_TENANT is false ──
+  // If the user explicitly disables default tenant seeding, remove any
+  // legacy "default" or "studio" tenants that might exist from earlier runs.
+  if (!SEED_DEFAULT_TENANT) {
+    await prisma.membership.deleteMany({
+      where: { tenant: { slug: DEFAULT_TENANT_SLUG } },
+    });
+    await prisma.tenant.deleteMany({ where: { slug: DEFAULT_TENANT_SLUG } });
+  }
 
   // eslint-disable-next-line no-console
   console.log(
@@ -157,6 +215,11 @@ async function main() {
       `  platformTenant = ${platformTenant.slug}`,
       `  cms.site       = ${cmsResult.siteId}`,
       `  cms.pages      = home:${cmsResult.created.home ? "new" : "kept"}, __login:${cmsResult.created.login ? "new" : "kept"}, __members:${cmsResult.created.members ? "new" : "kept"}`,
+      ...(defaultTenant
+        ? [
+            `  defaultTenant  = ${defaultTenant.slug} (${DEFAULT_TENANT_NAME})`,
+          ]
+        : []),
     ].join("\n"),
   );
 }
