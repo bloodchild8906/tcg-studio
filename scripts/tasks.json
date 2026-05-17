@@ -223,5 +223,5 @@
   {"id":222,"status":"pending","subject":"CMS live preview pane must be scrollable","description":"min-h-0 fix shipped; verify in deployed version."},
   {"id":223,"status":"completed","subject":"Publish repo to GitHub + Actions deploy to VM","description":"GitHub Actions deploy pipeline."},
   {"id":224,"status":"completed","subject":"Tenant create + user assignment + platform user management","description":"Tenant create-time owner assignment + platform admin tenant-user management endpoints."},
-  {"id":225,"status":"in_progress","subject":"Workflow updates wiki + GitHub issues","description":"Deploy workflow now updates wiki + build-status issue. Seed issue per task."}
+  {"id":225,"status":"completed","subject":"Workflow updates wiki + GitHub issues","description":"Deploy workflow now updates wiki + build-status issue. Seed issue per task."}
 ]
