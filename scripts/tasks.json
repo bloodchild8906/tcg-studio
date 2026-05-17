@@ -219,9 +219,10 @@
   {"id":218,"status":"completed","subject":"SMTP outbound + Cloudflare Email Routing for tcgstudio.online","description":"Brevo SMTP + CF Email Routing."},
   {"id":219,"status":"in_progress","subject":"Profile + whitelabel images stored in DB (not MinIO)","description":"Schema/endpoints done, UI uploaders not yet wired."},
   {"id":220,"status":"pending","subject":"Platform 'Create tenant' UI + CMS template plugins","description":"Create-tenant UI done; CMS template plugins still pending."},
-  {"id":221,"status":"pending","subject":"CMS columns block — resizable column widths","description":"widthFr metadata done, drag-handle UI to set the ratio still missing."},
+  {"id":221,"status":"completed","subject":"CMS columns block — resizable column widths","description":"widthFr metadata + flex rendering + drag-handle gutters in editor mode. Pointer-capture-based resize preserves the sum-of-fr invariant so re-proportioning one pair doesn't reflow the whole row."},
   {"id":222,"status":"pending","subject":"CMS live preview pane must be scrollable","description":"min-h-0 fix shipped; verify in deployed version."},
   {"id":223,"status":"completed","subject":"Publish repo to GitHub + Actions deploy to VM","description":"GitHub Actions deploy pipeline."},
   {"id":224,"status":"completed","subject":"Tenant create + user assignment + platform user management","description":"Tenant create-time owner assignment + platform admin tenant-user management endpoints."},
-  {"id":225,"status":"completed","subject":"Workflow updates wiki + GitHub issues","description":"Deploy workflow now updates wiki + build-status issue. Seed issue per task."}
+  {"id":225,"status":"completed","subject":"Workflow updates wiki + GitHub issues","description":"Deploy workflow now updates wiki + build-status issue. Seed issue per task."},
+  {"id":226,"status":"completed","subject":"Harden deploy smoke test","description":"Smoke test now probes both the public host via Cloudflare and the VM directly by IP. Either returning 200 counts as healthy. Retry budget widened from 25s to 60s."}
 ]

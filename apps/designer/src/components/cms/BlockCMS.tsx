@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, memo } from "react";
+import { useState, useEffect, useCallback, useRef, memo, Fragment } from "react";
 import {
   Plus,
   Trash2,
@@ -545,6 +545,119 @@ export const BlockCMS = ({
 
   // --- Renderers ---
 
+  /**
+   * Drag-handle gutter inserted between two adjacent columns in
+   * editor mode. Lets the operator visually re-proportion the columns
+   * without opening the metadata JSON panel.
+   *
+   * Implementation:
+   *   - We track pointer movement on `pointerdown` → `pointermove` →
+   *     `pointerup` with setPointerCapture, so dragging works even if
+   *     the cursor briefly leaves the handle (8px wide handle would
+   *     otherwise lose pointer-leave constantly).
+   *   - On each move we compute the new fr ratio from the current
+   *     pixel split of the row. We measure the row width via the
+   *     parent's bounding rect.
+   *   - We preserve the SUM of the two adjacent columns' widthFr —
+   *     other columns in the row keep their ratio. That way grabbing
+   *     one gutter doesn't reflow the whole row.
+   */
+  const ColumnResizer = ({
+    left,
+    right,
+    onResize,
+  }: {
+    left: Block;
+    right: Block;
+    onResize: (leftFr: number, rightFr: number) => void;
+  }) => {
+    const handleRef = useRef<HTMLDivElement>(null);
+    const stateRef = useRef<{
+      startX: number;
+      sumFr: number;
+      rowWidthPx: number;
+      // Pixel width of the left column at drag-start. Used to map
+      // pointer delta back into fr space.
+      leftPxStart: number;
+      rightPxStart: number;
+    } | null>(null);
+
+    const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const handle = handleRef.current;
+      if (!handle) return;
+      // The row is the closest ancestor with `flex` layout — that's
+      // the columns container we sit inside.
+      const row = handle.parentElement;
+      if (!row) return;
+      // Find the two sibling .min-w-0 wrappers we sit between. The
+      // resizer's previous sibling is the left column wrapper, the
+      // next sibling is the right column wrapper.
+      const leftEl = handle.previousElementSibling as HTMLElement | null;
+      const rightEl = handle.nextElementSibling as HTMLElement | null;
+      if (!leftEl || !rightEl) return;
+
+      const lMeta = (left.metadata ?? {}) as { widthFr?: number };
+      const rMeta = (right.metadata ?? {}) as { widthFr?: number };
+      const lFr = typeof lMeta.widthFr === "number" && lMeta.widthFr > 0 ? lMeta.widthFr : 1;
+      const rFr = typeof rMeta.widthFr === "number" && rMeta.widthFr > 0 ? rMeta.widthFr : 1;
+
+      stateRef.current = {
+        startX: e.clientX,
+        sumFr: lFr + rFr,
+        rowWidthPx: row.getBoundingClientRect().width,
+        leftPxStart: leftEl.getBoundingClientRect().width,
+        rightPxStart: rightEl.getBoundingClientRect().width,
+      };
+      handle.setPointerCapture(e.pointerId);
+    };
+
+    const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+      const s = stateRef.current;
+      if (!s) return;
+      const dx = e.clientX - s.startX;
+      // Pixel widths at this point in the drag.
+      const newLeftPx = Math.max(40, s.leftPxStart + dx);
+      const newRightPx = Math.max(40, s.rightPxStart - dx);
+      // Re-derive fr from the pixel split. The sumFr is the same as
+      // before (we're only redistributing between this pair) so the
+      // ratio is newLeftPx / (newLeftPx + newRightPx) × sumFr.
+      const total = newLeftPx + newRightPx;
+      const leftFr = (newLeftPx / total) * s.sumFr;
+      const rightFr = s.sumFr - leftFr;
+      onResize(leftFr, rightFr);
+    };
+
+    const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+      stateRef.current = null;
+      const handle = handleRef.current;
+      if (handle && handle.hasPointerCapture(e.pointerId)) {
+        handle.releasePointerCapture(e.pointerId);
+      }
+    };
+
+    return (
+      <div
+        ref={handleRef}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        title="Drag to resize columns"
+        className="group relative w-2 shrink-0 cursor-col-resize select-none"
+        // Stop block dragging in the parent — we hijack pointer
+        // events for resizing here.
+        draggable={false}
+      >
+        {/* Subtle vertical line that lights up on hover/drag. The
+            outer 8px hit area is invisible, the inner 2px line gives
+            the operator a visual target. */}
+        <div className="pointer-events-none absolute inset-y-2 left-1/2 w-px -translate-x-1/2 bg-ink-700 transition-colors group-hover:bg-accent-500/60" />
+      </div>
+    );
+  };
+
   const EditorBlock = memo(({ block }: { block: Block }) => {
     const isColumn = block.type === "column";
     const isColumns = block.type === "columns";
@@ -586,10 +699,55 @@ export const BlockCMS = ({
 
           <div className={cn("flex flex-col", !isColumn && "ml-8")}>
             {isColumns ? (
-              <div className="flex min-h-[140px] gap-4">
-                {block.children?.map((child) => (
-                  <EditorBlock key={child.id} block={child} />
-                ))}
+              // Columns row in editor mode. We respect the same
+              // metadata.widthFr the preview reads, AND we drop a
+              // resizer gutter between adjacent columns so the
+              // operator can drag the split visually. The first
+              // column has no gutter to its left, the last has none
+              // to its right — gutters live between pairs.
+              <div className="flex min-h-[140px] items-stretch gap-0">
+                {block.children?.map((child, idx) => {
+                  const meta = (child.metadata ?? {}) as { widthFr?: number };
+                  const fr =
+                    typeof meta.widthFr === "number" && meta.widthFr > 0
+                      ? meta.widthFr
+                      : 1;
+                  const next =
+                    idx < (block.children?.length ?? 0) - 1
+                      ? block.children?.[idx + 1]
+                      : null;
+                  return (
+                    <Fragment key={child.id}>
+                      <div
+                        className="min-w-0"
+                        style={{ flex: `${fr} 1 0%` }}
+                      >
+                        <EditorBlock block={child} />
+                      </div>
+                      {next && (
+                        <ColumnResizer
+                          left={child}
+                          right={next}
+                          onResize={(leftFr, rightFr) => {
+                            // Cap min width at 0.2 fr so a column never
+                            // disappears. The drag handler clamps too,
+                            // but defensive here as well.
+                            const lMeta = (child.metadata ?? {}) as Record<string, unknown>;
+                            const rMeta = (next.metadata ?? {}) as Record<string, unknown>;
+                            updateBlockMetadata(child.id, {
+                              ...lMeta,
+                              widthFr: Math.max(0.2, leftFr),
+                            } as BlockMetadata);
+                            updateBlockMetadata(next.id, {
+                              ...rMeta,
+                              widthFr: Math.max(0.2, rightFr),
+                            } as BlockMetadata);
+                          }}
+                        />
+                      )}
+                    </Fragment>
+                  );
+                })}
               </div>
             ) : isColumn ? (
               <div className="flex h-full flex-col space-y-2">
