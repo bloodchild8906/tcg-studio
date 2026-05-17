@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as api from "@/lib/api";
 import type { UserProfile } from "@/lib/api";
 import { useAssetPicker } from "@/components/AssetPicker";
@@ -23,6 +23,16 @@ export function ProfileView() {
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Inline avatar (BYTEA on User row, separate from the asset-library
+  // path). When a user uploads via the "Upload directly" button below
+  // we PUT a file to /api/v1/users/me/avatar and bump the cache buster
+  // so the <img> reloads. We also probe on mount with a HEAD-style
+  // GET so we know whether to render the inline image or the picker
+  // fallback.
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [hasInlineAvatar, setHasInlineAvatar] = useState(false);
+  const [avatarCacheBuster, setAvatarCacheBuster] = useState<number>(Date.now());
+  const [avatarUploading, setAvatarUploading] = useState(false);
 
   const picker = useAssetPicker((picked) => {
     setAvatarAssetId(picked.id);
@@ -32,13 +42,23 @@ export function ProfileView() {
     let alive = true;
     api
       .fetchMyProfile()
-      .then((p) => {
+      .then(async (p) => {
         if (!alive) return;
         setProfile(p);
         setDisplayName(p.displayName ?? "");
         setBio(p.bio);
         setTimezone(p.timezone);
         setAvatarAssetId(p.avatarAssetId);
+        // Probe the inline avatar endpoint — a 200 means we have a
+        // BYTEA-stored avatar to prefer over the asset one. We send a
+        // HEAD-equivalent (the GET costs ~0; the response is a few KB
+        // at most and we can fall through to the picker on 404).
+        try {
+          const res = await fetch(api.inlineAvatarUrl(p.id), { method: "GET" });
+          if (alive) setHasInlineAvatar(res.ok);
+        } catch {
+          /* network blip; ignore */
+        }
       })
       .catch((err) =>
         setError(err instanceof Error ? err.message : "load failed"),
@@ -47,6 +67,35 @@ export function ProfileView() {
       alive = false;
     };
   }, []);
+
+  async function uploadInlineAvatar(file: File) {
+    setAvatarUploading(true);
+    setError(null);
+    try {
+      await api.uploadMyAvatar(file);
+      setHasInlineAvatar(true);
+      setAvatarCacheBuster(Date.now());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "avatar upload failed");
+    } finally {
+      setAvatarUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  async function removeInlineAvatar() {
+    setAvatarUploading(true);
+    setError(null);
+    try {
+      await api.deleteMyAvatar();
+      setHasInlineAvatar(false);
+      setAvatarCacheBuster(Date.now());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "avatar remove failed");
+    } finally {
+      setAvatarUploading(false);
+    }
+  }
 
   async function save() {
     setBusy(true);
@@ -94,7 +143,16 @@ export function ProfileView() {
         <section className="space-y-3 rounded-lg border border-ink-800 bg-ink-900 p-4">
           <div className="flex items-center gap-4">
             <div className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full border border-ink-700 bg-ink-800">
-              {avatarAssetId ? (
+              {hasInlineAvatar ? (
+                // Inline (BYTEA) avatar takes precedence over the asset
+                // ref — it's the user's "I uploaded my own" path and
+                // shouldn't be silently overridden by an asset pick.
+                <img
+                  src={api.inlineAvatarUrl(profile.id, avatarCacheBuster)}
+                  alt=""
+                  className="h-full w-full object-cover"
+                />
+              ) : avatarAssetId ? (
                 <img
                   src={api.assetBlobUrl(avatarAssetId)}
                   alt=""
@@ -104,25 +162,67 @@ export function ProfileView() {
                 <span className="text-xl font-semibold text-ink-500">?</span>
               )}
             </div>
-            <div className="space-y-1">
-              <button
-                type="button"
-                onClick={picker.open}
-                className="rounded border border-accent-500/40 bg-accent-500/15 px-3 py-1 text-xs text-accent-300 hover:bg-accent-500/25"
-              >
-                {avatarAssetId ? "Change avatar" : "Pick avatar"}
-              </button>
-              {avatarAssetId && (
+            <div className="flex-1 space-y-2">
+              {/* Two parallel paths: upload directly to the DB (small,
+                  fast, no asset library required) OR pick from any
+                  tenant asset library (good for re-using an existing
+                  pro photo someone already curated). Direct upload
+                  wins on display when present. */}
+              <div className="flex flex-wrap gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void uploadInlineAvatar(f);
+                  }}
+                />
                 <button
                   type="button"
-                  onClick={() => setAvatarAssetId(null)}
-                  className="ml-2 rounded border border-ink-700 bg-ink-800 px-3 py-1 text-xs text-ink-300 hover:bg-ink-700"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={avatarUploading}
+                  className="rounded border border-accent-500/40 bg-accent-500/15 px-3 py-1 text-xs text-accent-300 hover:bg-accent-500/25 disabled:opacity-50"
                 >
-                  Remove
+                  {avatarUploading
+                    ? "Uploading…"
+                    : hasInlineAvatar
+                    ? "Replace upload"
+                    : "Upload photo"}
                 </button>
-              )}
+                {hasInlineAvatar && (
+                  <button
+                    type="button"
+                    onClick={() => void removeInlineAvatar()}
+                    disabled={avatarUploading}
+                    className="rounded border border-danger-500/30 bg-danger-500/10 px-3 py-1 text-xs text-danger-300 hover:bg-danger-500/20 disabled:opacity-50"
+                  >
+                    Remove upload
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={picker.open}
+                  className="rounded border border-ink-700 bg-ink-800 px-3 py-1 text-xs text-ink-200 hover:bg-ink-700"
+                >
+                  {avatarAssetId ? "Change asset" : "Pick from assets"}
+                </button>
+                {avatarAssetId && (
+                  <button
+                    type="button"
+                    onClick={() => setAvatarAssetId(null)}
+                    className="rounded border border-ink-700 bg-ink-800 px-3 py-1 text-xs text-ink-300 hover:bg-ink-700"
+                  >
+                    Clear asset
+                  </button>
+                )}
+              </div>
               <p className="text-[11px] text-ink-500">
-                Pick from any tenant's asset library.
+                Upload (max 256 KB, png/jpeg/webp/gif/svg) is stored
+                directly on your account and shown across every tenant.
+                The asset pick is per-tenant and only shows when no
+                direct upload is set.
               </p>
             </div>
           </div>

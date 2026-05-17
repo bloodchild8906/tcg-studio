@@ -2591,6 +2591,94 @@ export async function updateMyProfile(
   return r.profile;
 }
 
+/**
+ * URL the browser can hit to fetch a user's inline avatar (BYTEA
+ * column on User, served by `/api/v1/users/:id/avatar`). The server
+ * emits ETags so this is cheap to embed in <img> tags. Append `?v=…`
+ * after an upload to bust the browser's existing cache entry.
+ */
+export function inlineAvatarUrl(userId: string, cacheBuster?: string | number): string {
+  const base = `${API_BASE}/api/v1/users/${encodeURIComponent(userId)}/avatar`;
+  return cacheBuster ? `${base}?v=${encodeURIComponent(String(cacheBuster))}` : base;
+}
+
+/** Upload a new avatar for the signed-in user. Inline-stored (BYTEA),
+ *  max 256 KB, mime must be one of png/jpeg/webp/gif/svg/ico. */
+export async function uploadMyAvatar(
+  file: File,
+): Promise<{ ok: true; bytes: number; mime: string }> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const url = new URL("/api/v1/users/me/avatar", API_BASE);
+  const headers: Record<string, string> = { "X-Tenant-Slug": _tenantSlug };
+  if (_authToken) headers["Authorization"] = `Bearer ${_authToken}`;
+  const res = await fetch(url.toString(), { method: "PUT", body: fd, headers });
+  const text = await res.text();
+  const parsed = text ? safeParseJson(text) : undefined;
+  if (!res.ok) {
+    throw new ApiError(
+      (parsed as { error?: string } | undefined)?.error ?? `avatar upload failed (${res.status})`,
+      res.status,
+      parsed,
+    );
+  }
+  return parsed as { ok: true; bytes: number; mime: string };
+}
+
+export async function deleteMyAvatar(): Promise<void> {
+  await request<void>("/api/v1/users/me/avatar", { method: "DELETE" });
+}
+
+/** Public URL for a tenant's inline-stored brand asset. Mirrors
+ *  /api/v1/public/:slug/branding/{logo|icon|favicon} on the backend. */
+export function inlineTenantBrandingUrl(
+  slug: string,
+  kind: "logo" | "icon" | "favicon",
+  cacheBuster?: string | number,
+): string {
+  const base = `${API_BASE}/api/v1/public/${encodeURIComponent(slug)}/branding/${kind}`;
+  return cacheBuster ? `${base}?v=${encodeURIComponent(String(cacheBuster))}` : base;
+}
+
+/** Upload a tenant brand image (logo/icon/favicon). Inline-stored
+ *  (BYTEA), max 512 KB. Requires tenant_owner / tenant_admin OR a
+ *  platform admin. */
+export async function uploadTenantBranding(
+  tenantId: string,
+  kind: "logo" | "icon" | "favicon",
+  file: File,
+): Promise<{ ok: true; kind: string; bytes: number; mime: string }> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const url = new URL(
+    `/api/v1/tenants/${encodeURIComponent(tenantId)}/branding/${kind}`,
+    API_BASE,
+  );
+  const headers: Record<string, string> = { "X-Tenant-Slug": _tenantSlug };
+  if (_authToken) headers["Authorization"] = `Bearer ${_authToken}`;
+  const res = await fetch(url.toString(), { method: "PUT", body: fd, headers });
+  const text = await res.text();
+  const parsed = text ? safeParseJson(text) : undefined;
+  if (!res.ok) {
+    throw new ApiError(
+      (parsed as { error?: string } | undefined)?.error ?? `branding upload failed (${res.status})`,
+      res.status,
+      parsed,
+    );
+  }
+  return parsed as { ok: true; kind: string; bytes: number; mime: string };
+}
+
+export async function deleteTenantBranding(
+  tenantId: string,
+  kind: "logo" | "icon" | "favicon",
+): Promise<void> {
+  await request<void>(
+    `/api/v1/tenants/${encodeURIComponent(tenantId)}/branding/${kind}`,
+    { method: "DELETE" },
+  );
+}
+
 export interface NotificationRow {
   id: string;
   userId: string;

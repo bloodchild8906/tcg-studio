@@ -9,7 +9,9 @@ import {
   assetBlobUrl,
   createPlatformRole,
   deletePlatformRole,
+  deleteTenantBranding,
   grantPlatformAdmin,
+  inlineTenantBrandingUrl,
   inviteMember,
   inviteProjectMember,
   listMemberships,
@@ -24,6 +26,7 @@ import {
   updatePlatformRole,
   updateProjectMemberRole,
   updateTenant,
+  uploadTenantBranding,
 } from "@/lib/api";
 import type { PermissionDef, PlatformAdminRow, RoleRow } from "@/lib/api";
 import type {
@@ -1641,6 +1644,17 @@ function BrandSection() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedTick, setSavedTick] = useState(false);
+  // Inline-stored brand images (BYTEA on Tenant). Separate from the
+  // asset-library path: the operator uploads a file and we PUT it
+  // straight to /api/v1/tenants/:id/branding/:kind. The presence
+  // flags let us show "Replace" + "Remove" buttons after upload.
+  const [hasInlineLogo, setHasInlineLogo] = useState(false);
+  const [hasInlineIcon, setHasInlineIcon] = useState(false);
+  const [hasInlineFavicon, setHasInlineFavicon] = useState(false);
+  const [brandCacheBuster, setBrandCacheBuster] = useState<number>(Date.now());
+  const [brandUploading, setBrandUploading] = useState<
+    "logo" | "icon" | "favicon" | null
+  >(null);
 
   // Project-scoped asset picker. The tenant logo lives on the tenant, but
   // the asset library itself is project-scoped (sec 20.3). The user picks
@@ -1658,7 +1672,67 @@ function BrandSection() {
     setSupportEmail(typeof b.supportEmail === "string" ? b.supportEmail : "");
     setLegalName(typeof b.legalName === "string" ? b.legalName : "");
     setMembersAreaEnabled(b.membersAreaEnabled === true);
+
+    // Probe each inline-image endpoint so we know whether to render
+    // the upload-thumbnail. 404 = no image yet, 200 = exists. We GET
+    // (not HEAD) because the public branding routes don't define
+    // HEAD; the cost is one byte stream per kind which is negligible
+    // for cached responses.
+    let alive = true;
+    (async () => {
+      const probes = await Promise.all(
+        (["logo", "icon", "favicon"] as const).map(async (k) => {
+          try {
+            const res = await fetch(inlineTenantBrandingUrl(tenant.slug, k));
+            return res.ok;
+          } catch {
+            return false;
+          }
+        }),
+      );
+      if (!alive) return;
+      setHasInlineLogo(probes[0]);
+      setHasInlineIcon(probes[1]);
+      setHasInlineFavicon(probes[2]);
+    })();
+    return () => {
+      alive = false;
+    };
   }, [tenant?.id, tenant?.updatedAt]);
+
+  async function uploadBrand(kind: "logo" | "icon" | "favicon", file: File) {
+    if (!tenant) return;
+    setBrandUploading(kind);
+    setError(null);
+    try {
+      await uploadTenantBranding(tenant.id, kind, file);
+      if (kind === "logo") setHasInlineLogo(true);
+      if (kind === "icon") setHasInlineIcon(true);
+      if (kind === "favicon") setHasInlineFavicon(true);
+      setBrandCacheBuster(Date.now());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `${kind} upload failed`);
+    } finally {
+      setBrandUploading(null);
+    }
+  }
+
+  async function removeBrand(kind: "logo" | "icon" | "favicon") {
+    if (!tenant) return;
+    setBrandUploading(kind);
+    setError(null);
+    try {
+      await deleteTenantBranding(tenant.id, kind);
+      if (kind === "logo") setHasInlineLogo(false);
+      if (kind === "icon") setHasInlineIcon(false);
+      if (kind === "favicon") setHasInlineFavicon(false);
+      setBrandCacheBuster(Date.now());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `${kind} remove failed`);
+    } finally {
+      setBrandUploading(null);
+    }
+  }
 
   if (!tenant) return null;
 
@@ -1739,6 +1813,81 @@ function BrandSection() {
           {picker.element}
         </div>
       </FieldRow>
+
+      {/*
+        Inline brand uploads — separate from the asset-library pick
+        above. The operator drags-and-drops a file and we PUT it
+        straight into the Tenant row's BYTEA column. Storage choice
+        per kind:
+          • Logo: 512 KB cap, served at /public/:slug/branding/logo
+          • Icon: same path, "icon" suffix — used for square favicons
+            we want at higher resolution than .ico
+          • Favicon: .ico-style 32×32 served as image/x-icon
+        Each row shows a thumbnail when present, and "Upload" /
+        "Replace" / "Remove" buttons.
+      */}
+      {(["logo", "icon", "favicon"] as const).map((kind) => {
+        const present =
+          kind === "logo"
+            ? hasInlineLogo
+            : kind === "icon"
+            ? hasInlineIcon
+            : hasInlineFavicon;
+        const labels = {
+          logo: { label: "Logo upload", hint: "Direct upload (max 512 KB). Wins over asset pick when set." },
+          icon: { label: "Square icon", hint: "Higher-res square mark used for app-icon contexts." },
+          favicon: { label: "Favicon", hint: "Small (16-32px) icon shown in browser tabs." },
+        }[kind];
+        return (
+          <FieldRow key={kind} label={labels.label} hint={labels.hint}>
+            <div className="flex items-center gap-3">
+              <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded border border-ink-700 bg-ink-900">
+                {present ? (
+                  <img
+                    src={inlineTenantBrandingUrl(tenant.slug, kind, brandCacheBuster)}
+                    alt=""
+                    className="max-h-full max-w-full object-contain"
+                  />
+                ) : (
+                  <span className="text-[10px] uppercase tracking-wider text-ink-600">
+                    none
+                  </span>
+                )}
+              </div>
+              <label className="rounded border border-ink-600 bg-ink-800 px-2.5 py-1.5 text-xs text-ink-100 hover:bg-ink-700 cursor-pointer">
+                {brandUploading === kind
+                  ? "Uploading…"
+                  : present
+                  ? "Replace…"
+                  : "Upload…"}
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml,image/x-icon,image/vnd.microsoft.icon"
+                  className="hidden"
+                  disabled={brandUploading === kind}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void uploadBrand(kind, f);
+                    // Reset so picking the same filename twice re-fires onChange.
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+              {present && (
+                <button
+                  type="button"
+                  onClick={() => void removeBrand(kind)}
+                  disabled={brandUploading === kind}
+                  className="rounded border border-transparent px-2 py-1 text-[11px] text-ink-400 hover:border-ink-700 hover:bg-ink-800 hover:text-ink-100 disabled:opacity-50"
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+          </FieldRow>
+        );
+      })}
+
       <FieldRow label="Product name" hint="Replaces 'TCGStudio' in the header.">
         <input
           type="text"
